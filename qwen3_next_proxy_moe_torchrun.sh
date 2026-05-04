@@ -117,6 +117,10 @@ PRETRAIN_ARGS+=(
     --lr-decay-samples 255126953
     --lr-warmup-samples 162761
     --bf16
+    --fp8-format e4m3
+    --fp8-recipe mxfp8
+    --fp8-param-gather
+    --fp8-format hybrid
     --enable-experimental
     --mock-data
     --data-cache-path $DATA_CACHE_PATH
