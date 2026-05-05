@@ -67,6 +67,20 @@ def main():
         pg_collection=pg_collection,
     ).cuda()
 
+    # Wrap MambaLayer in a thin parent so that MegatronFSDP's root is not itself
+    # an FSDP unit. Otherwise MegatronFSDP.forward calls `self.module.forward(...)`
+    # directly, which bypasses the forward hooks (including _post_forward,
+    # pre-backward, post-backward) registered on the FSDP unit.
+    class _Wrapper(torch.nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layer = layer
+
+        def forward(self, x):
+            return self.layer(x)
+
+    root = _Wrapper(layer).cuda()
+
     ddp_config = DistributedDataParallelConfig(
         data_parallel_sharding_strategy="optim_grads_params",
         overlap_grad_reduce=True,
@@ -76,7 +90,7 @@ def main():
     fsdp_layer = FullyShardedDataParallel(
         config=transformer_config,
         ddp_config=ddp_config,
-        module=layer,
+        module=root,
     )
 
     rank = torch.distributed.get_rank()
@@ -95,18 +109,19 @@ def main():
     micro_batch = 2
     conv1d = layer.mixer.conv1d
     in_proj = layer.mixer.in_proj
+    mixer = layer.mixer
 
     def describe(name, p):
         local = p.to_local() if hasattr(p, "to_local") else p
         return (
             f"{name} type={type(p).__name__} global_shape={tuple(p.shape)} "
             f"local_shape={tuple(local.shape)} local_numel={local.numel()} "
-            f"data_ptr={local.data_ptr():x}"
+            f"data_ptr={local.data_ptr():x} "
+            f"nbytes={local.untyped_storage().nbytes()}"
         )
 
     for it in range(3):
         print(f"[rank {rank}] iter {it} pre-fwd {describe('conv1d.weight', conv1d.weight)}", flush=True)
-        print(f"[rank {rank}] iter {it} pre-fwd {describe('in_proj.weight', in_proj.weight)}", flush=True)
         x = torch.randn(
             seq_len,
             micro_batch,

@@ -569,6 +569,7 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
+            print(f"release_module_parameters {module._get_name()}: {[p.shape for p in module.parameters()]=}", flush=True)
             for param in module.parameters():
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
                 self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
@@ -759,6 +760,7 @@ class MegatronFSDP(torch.nn.Module):
             if self.enable_fine_grained_param_gather_hook:
                 param_list = list(module.parameters(recurse=False))
 
+            print(f"_pre_forward_param_unshard {module._get_name()}: {[p.shape for p in param_list]=}", flush=True)
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
                 params=param_list,
@@ -942,6 +944,7 @@ class MegatronFSDP(torch.nn.Module):
                 module, tuple(fsdp_unit_modules)
             ), "_post_forward hook should only be registered on FSDP unit modules."
 
+            print(f"_post_forward {module._get_name()}", flush=True)
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
 
