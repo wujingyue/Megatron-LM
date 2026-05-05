@@ -21,6 +21,7 @@ import torch
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -42,12 +43,15 @@ def main():
     model_parallel_cuda_manual_seed(123)
 
     transformer_config = TransformerConfig(
-        hidden_size=512,
+        hidden_size=1024,
         num_layers=1,
         num_attention_heads=1,
         context_parallel_size=2,
         bf16=True,
         params_dtype=torch.bfloat16,
+        fp8='hybrid',
+        fp8_recipe='mxfp8',
+        fp8_param=True,
     )
 
     # 'tp' is required by MambaMixer (reads pg_collection.tp.size() and uses it
@@ -62,11 +66,12 @@ def main():
         hybrid_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules
     )
     torch.cuda.memory._record_memory_history()
-    layer = MambaLayer(
-        transformer_config,
-        hybrid_stack_spec.submodules.mamba_layer.submodules,
-        pg_collection=pg_collection,
-    ).cuda()
+    with get_fp8_context(transformer_config, is_init=True):
+        layer = MambaLayer(
+            transformer_config,
+            hybrid_stack_spec.submodules.mamba_layer.submodules,
+            pg_collection=pg_collection,
+        ).cuda()
 
     # Wrap MambaLayer in a thin parent so that MegatronFSDP's root is not itself
     # an FSDP unit. Otherwise MegatronFSDP.forward calls `self.module.forward(...)`
@@ -87,6 +92,7 @@ def main():
         overlap_grad_reduce=True,
         overlap_param_gather=True,
         use_megatron_fsdp=True,
+        fp8_param_gather=True,
     )
     fsdp_layer = FullyShardedDataParallel(
         config=transformer_config,
@@ -131,8 +137,9 @@ def main():
             dtype=torch.bfloat16,
             requires_grad=True,
         )
-        out = fsdp_layer(x)
-        out.sum().backward()
+        with get_fp8_context(transformer_config):
+            out = fsdp_layer(x)
+            out.sum().backward()
         torch.cuda.synchronize()
         print(f"[rank {rank}] iter {it} ok", flush=True)
     torch.cuda.memory._dump_snapshot(f"mem_rank{rank}.pickle")
