@@ -463,6 +463,7 @@ class MegatronFSDP(torch.nn.Module):
         if self.data_parallel_sharding_strategy == "no_shard":
             return
 
+        print(f"  all_gather_and_wait_parameters_ready: {[p.shape for p in params]}", flush=True)
         ag_pipeline = self.all_gather_pipeline
         # Only all-gather HSDP buffer parameters in the beginning of a new optimization
         # step cycle, or on every step if model_auto_sync is enabled, i.e. update
@@ -569,7 +570,7 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
-            print(f"release_module_parameters {module._get_name()}: {[p.shape for p in module.parameters()]=}", flush=True)
+            print(f"  release_module_parameters {module._get_name()}: {[p.shape for p in module.parameters()]}", flush=True)
             for param in module.parameters():
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
                 self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
@@ -646,6 +647,7 @@ class MegatronFSDP(torch.nn.Module):
             - Releases the module's parameters for the backward phase to free memory.
             - Marks the module as IDLE in the training state machine.
             """
+            print(f"_post_backward_release_module: {module._get_name()}")
             assert isinstance(module, tuple(fsdp_unit_modules))
             assert self.data_parallel_sharding_strategy == "optim_grads_params"
 
@@ -760,7 +762,7 @@ class MegatronFSDP(torch.nn.Module):
             if self.enable_fine_grained_param_gather_hook:
                 param_list = list(module.parameters(recurse=False))
 
-            print(f"_pre_forward_param_unshard {module._get_name()}: {[p.shape for p in param_list]=}", flush=True)
+            print(f"_pre_forward_param_unshard: {module._get_name()}", flush=True)
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
                 params=param_list,
@@ -871,6 +873,7 @@ class MegatronFSDP(torch.nn.Module):
             Sub-module pre-backward hook to all-gather the module parameters
             before the backward pass.
             """
+            print(f"_pre_backward_param_unshard: {module._get_name()}", flush=True)
             # Set the module's training state to PRE_BACKWARD.
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.PRE_BACKWARD
@@ -944,7 +947,7 @@ class MegatronFSDP(torch.nn.Module):
                 module, tuple(fsdp_unit_modules)
             ), "_post_forward hook should only be registered on FSDP unit modules."
 
-            print(f"_post_forward {module._get_name()}", flush=True)
+            print(f"_post_forward: {module._get_name()}", flush=True)
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
 

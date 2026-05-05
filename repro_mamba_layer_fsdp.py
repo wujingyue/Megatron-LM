@@ -61,6 +61,7 @@ def main():
     assert isinstance(
         hybrid_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules
     )
+    torch.cuda.memory._record_memory_history()
     layer = MambaLayer(
         transformer_config,
         hybrid_stack_spec.submodules.mamba_layer.submodules,
@@ -134,6 +135,8 @@ def main():
         out.sum().backward()
         torch.cuda.synchronize()
         print(f"[rank {rank}] iter {it} ok", flush=True)
+    torch.cuda.memory._dump_snapshot(f"mem_rank{rank}.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
 
     Utils.destroy_model_parallel()
 
