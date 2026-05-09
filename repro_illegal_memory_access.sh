@@ -1,0 +1,124 @@
+python -m torch.distributed.run \
+      --nproc_per_node 4 \
+      --nnodes 1 \
+      --local_ranks_filter 0 \
+      /opt/megatron-lm/pretrain_mamba.py \
+      --moe-router-score-function sigmoid \
+      --moe-grouped-gemm \
+      --num-experts 4 \
+      --moe-router-topk 2 \
+      --moe-aux-loss-coeff 1e-4 \
+      --moe-router-topk-scaling-factor 2.5 \
+      --moe-router-enable-expert-bias \
+      --moe-router-dtype fp32 \
+      --moe-router-load-balancing-type seq_aux_loss \
+      --moe-shared-expert-intermediate-size 10240 \
+      --moe-latent-size 2048 \
+      --moe-permute-fusion \
+      --moe-token-dispatcher-type flex \
+      --moe-flex-dispatcher-backend hybridep \
+      --moe-hybridep-num-sms 32 \
+      --moe-router-fusion \
+      --moe-router-force-load-balancing \
+      --num-workers 1 \
+      --disable-gloo-process-groups \
+      --ckpt-format torch_dist \
+      --ckpt-fully-parallel-save \
+      --ckpt-fully-parallel-load \
+      --ckpt-assume-constant-structure \
+      --squared-relu \
+      --no-mmap-bin-files \
+      --distributed-timeout-minutes 30 \
+      --exit-duration-in-mins 1430 \
+      --no-create-attention-mask-in-dataloader \
+      --overlap-grad-reduce \
+      --overlap-param-gather \
+      --tensor-model-parallel-size 1 \
+      --expert-model-parallel-size 2 \
+      --expert-tensor-parallel-size 1 \
+      --pipeline-model-parallel-size 1 \
+      --use-distributed-optimizer \
+      --high-priority-stream-groups ep \
+      --ddp-num-buckets 5 \
+      --grad-reduce-in-bf16 \
+      --ddp-reduce-scatter-with-fp32-accumulation \
+      --mock-data \
+      --is-hybrid-model \
+      --untie-embeddings-and-output-weights \
+      --init-method-std 0.0099 \
+      --position-embedding-type none \
+      --num-layers 11 \
+      --hidden-size 8192 \
+      --num-attention-heads 64 \
+      --group-query-attention \
+      --num-query-groups 8 \
+      --hybrid-override-pattern 'MEMEMEMEM*E' \
+      --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+      --ffn-hidden-size 5120 \
+      --kv-channels 128 \
+      --seq-length 8192 \
+      --max-position-embeddings 8192 \
+      --train-samples 40000 \
+      --lr-decay-style WSD \
+      --lr-warmup-samples 2000 \
+      --lr-decay-samples 38000 \
+      --lr-wsd-decay-style minus_sqrt \
+      --lr-wsd-decay-samples 40000 \
+      --save /lustre/fsw/coreai_dlalgo_llm/jingyuew/results/interactive_nt_debug/checkpoints \
+      --save-interval 10000 \
+      --data-cache-path /lustre/fsw/coreai_dlalgo_llm/jingyuew/results/interactive_nt_debug/../data-cache \
+      --tiktoken-pattern v2 \
+      --tokenizer-type TikTokenizer \
+      --tokenizer-model /lustre/fsw/coreai_dlalgo_llm/xren/my_work/nemo_megatron/perf_optimization/megatron/nemotron/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json \
+      --distributed-backend nccl \
+      --micro-batch-size 1 \
+      --global-batch-size 4 \
+      --lr 8.0e-4 \
+      --min-lr 8.0e-6 \
+      --weight-decay 0.1 \
+      --clip-grad 1.0 \
+      --attention-dropout 0.0 \
+      --hidden-dropout 0.0 \
+      --disable-bias-linear \
+      --normalization RMSNorm \
+      --adam-beta1 0.9 \
+      --adam-beta2 0.95 \
+      --log-interval 10 \
+      --log-params-norm \
+      --log-throughput \
+      --eval-interval 250 \
+      --eval-iters 14 \
+      --bf16 \
+      --use-mcore-models \
+      --enable-experimental \
+      --manual-gc-interval 10 \
+      --use-fused-weighted-squared-relu \
+      --cross-entropy-loss-fusion \
+      --cross-entropy-fusion-impl native \
+      --te-rng-tracker \
+      --recompute-granularity selective \
+      --recompute-modules moe_act \
+      --no-gradient-accumulation-fusion \
+      --main-params-dtype fp32 \
+      --use-precision-aware-optimizer \
+      --main-grads-dtype bf16 \
+      --exp-avg-dtype bf16 \
+      --exp-avg-sq-dtype bf16 \
+      --init-model-with-meta-device \
+      --megatron-fsdp-main-params-dtype bf16 \
+      --megatron-fsdp-main-grads-dtype bf16 \
+      --exit-interval 50 \
+      --moe-router-padding-for-quantization \
+      --fp8-format e4m3 \
+      --fp8-recipe mxfp8 \
+      --first-last-layers-bf16 \
+      --num-layers-at-start-in-bf16 0 \
+      --num-layers-at-end-in-bf16 1 \
+      --mtp-num-layers 2 \
+      --mtp-hybrid-override-pattern '*E' \
+      --calculate-per-token-loss \
+      --mtp-loss-scaling-factor 0.3 \
+      --use-megatron-fsdp \
+      --megatron-fsdp-grad-comm-dtype bf16 \
+      --data-parallel-sharding-strategy optim_grads_params \
+      --ckpt-format fsdp_dtensor
