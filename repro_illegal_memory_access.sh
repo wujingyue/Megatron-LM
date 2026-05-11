@@ -64,12 +64,12 @@ python -m torch.distributed.run \
       --lr-decay-samples 38000 \
       --lr-wsd-decay-style minus_sqrt \
       --lr-wsd-decay-samples 40000 \
-      --save /lustre/fsw/coreai_dlalgo_llm/jingyuew/results/interactive_nt_debug/checkpoints \
+      --save /lustre/fsw/coreai_dlalgo_llm/jingyuew/interactive_nt/checkpoints \
       --save-interval 10000 \
-      --data-cache-path /lustre/fsw/coreai_dlalgo_llm/jingyuew/results/interactive_nt_debug/../data-cache \
+      --data-cache-path /lustre/fsw/coreai_dlalgo_llm/jingyuew/interactive_nt/data-cache \
       --tiktoken-pattern v2 \
       --tokenizer-type TikTokenizer \
-      --tokenizer-model /lustre/fsw/coreai_dlalgo_llm/xren/my_work/nemo_megatron/perf_optimization/megatron/nemotron/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json \
+      --tokenizer-model /lustre/fsw/coreai_dlalgo_llm/jingyuew/interactive_nt/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json \
       --distributed-backend nccl \
       --micro-batch-size 1 \
       --global-batch-size 4 \
