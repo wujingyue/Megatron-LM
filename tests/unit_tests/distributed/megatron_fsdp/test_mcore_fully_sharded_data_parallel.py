@@ -943,3 +943,171 @@ def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
         better = "equal"
 
     return {"abs_diff": abs_diff, "rel_diff": rel_diff, "better": better}
+
+
+class TestFsdpNonUnitBucketPreservation:
+    """Regression test for the non-FSDP-unit bucket preservation fix.
+
+    Without the fix, AllGatherPipeline.reset() marks every bucket as
+    can_be_released and recycle_unused_buckets() frees the gather scratch
+    even for non-unit buckets. When a non-unit module's forward reads a
+    child sub-module's parameter as a *raw* tensor (bypassing
+    nn.Module.__call__), no pre-forward hook ever fires for that child,
+    so its bucket is never re-gathered — the fused kernel dereferences
+    freed storage and CUDA reports an illegal memory access.
+
+    MambaMixer is exactly that pattern: it passes self.conv1d.weight to
+    mamba_split_conv1d_scan_combined(...) without invoking self.conv1d()
+    The bug only surfaces when conv1d.weight lands in a *separate*
+    non-unit bucket from MambaMixer's recurse=False params (A_log/D/dt_bias);
+    otherwise MambaMixer's own pre-forward hook refreshes the shared
+    bucket on `set_param_data=True`. A small ddp_config.bucket_size
+    forces that split.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_non_unit_bucket_preserved_across_param_sync(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if Utils.world_size != 2:
+            pytest.skip(
+                "Non-unit bucket preservation test requires exactly 2 GPUs (DP=2)."
+            )
+        # Heavyweight Mamba kernel deps — only meaningful when present.
+        pytest.importorskip("mamba_ssm")
+        pytest.importorskip("causal_conv1d")
+        pytest.importorskip("einops")
+
+        # Local imports keep collection-time light when mamba deps are absent.
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.ssm.mamba_layer import MambaLayer
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        HIDDEN = 256       # d_inner = 2*HIDDEN = 512; nheads = 512 / 64 = 8
+        NUM_HEADS = 4
+        NUM_GROUPS = 8     # mamba_num_groups; nheads % ngroups == 0
+        SEQ_LEN = 64
+        MICRO_BATCH = 2
+        N_STEPS = 3
+
+        model_parallel_cuda_manual_seed(123)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "cp"]
+        )
+
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=HIDDEN,
+            ffn_hidden_size=HIDDEN,
+            num_attention_heads=NUM_HEADS,
+            is_hybrid_model=True,
+            mamba_state_dim=128,
+            mamba_head_dim=64,
+            mamba_num_groups=NUM_GROUPS,
+            use_mamba_mem_eff_path=True,  # forces mamba_split_conv1d_scan_combined
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            autocast_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            bias_dropout_fusion=False,
+            add_bias_linear=False,
+            gated_linear_unit=False,
+            sequence_parallel=False,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+        )
+
+        class HybridStack(torch.nn.Module):
+            """TransformerLayer (FSDP unit) → MambaLayer (non-unit).
+
+            MambaLayer holds the raw-weight-access trigger (MambaMixer's
+            mamba_split_conv1d_scan_combined reads self.conv1d.weight).
+            """
+
+            def __init__(self, config, pg_collection):
+                super().__init__()
+                self.attn_layer = TransformerLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
+                    layer_number=1,
+                    pg_collection=pg_collection,
+                    add_layer_offset=False,
+                )
+                self.mamba_layer = MambaLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.mamba_layer.submodules,
+                    layer_number=2,
+                    pg_collection=pg_collection,
+                )
+
+            def forward(self, hidden_states):
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
+                return self.mamba_layer(hidden_states=h)
+
+        torch.manual_seed(42)
+        model = HybridStack(transformer_config, pg_collection).cuda().to(torch.bfloat16)
+
+        # Small bucket_size is the key knob: it forces conv1d.weight into a
+        # different non-unit bucket from MambaMixer's A_log/D/dt_bias, so
+        # MambaMixer's pre-forward hook *doesn't* refresh the bucket holding
+        # conv1d.weight. fsdp_unit_modules=[TransformerLayer] matches the
+        # production default in mcore_fsdp_adapter.py.
+        ddp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=4096,
+            use_megatron_fsdp=True,
+        )
+        fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=ddp_config,
+            module=model,
+            fsdp_unit_modules=[TransformerLayer],
+        )
+
+        # Sanity-check the bucket layout: we want >=1 unit bucket and
+        # multiple non-unit buckets — otherwise we are not actually
+        # exercising the bug scenario.
+        param_groups = fsdp_model.param_and_grad_buffer.parameter_groups
+        unit_buckets = [pg for pg in param_groups if pg.fsdp_unit_id is not None]
+        non_unit_buckets = [pg for pg in param_groups if pg.fsdp_unit_id is None]
+        assert len(unit_buckets) >= 1, "Expected at least one FSDP-unit bucket."
+        assert len(non_unit_buckets) >= 2, (
+            f"Expected non-unit params to split across multiple buckets "
+            f"(bucket_size too large?), got {len(non_unit_buckets)}."
+        )
+
+        torch.manual_seed(0)
+        x = torch.randn(SEQ_LEN, MICRO_BATCH, HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+        # Loop pattern from production: synchronize_param_gather() each iter
+        # invokes AllGatherPipeline.reset(). Without the fix, this releases
+        # non-unit bucket scratch storage; the next forward's raw read of
+        # conv1d.weight inside mamba_split_conv1d_scan_combined dereferences
+        # freed memory → CUDA illegal memory access. With the fix, non-unit
+        # bucket storage is preserved and the loop completes cleanly.
+        for _ in range(N_STEPS):
+            fsdp_model.synchronize_param_gather()
+            out = fsdp_model(x)
+            out.sum().backward()
+            # Drain any pending grad sync so the next reset() sees a clean state.
+            fsdp_model.finish_grad_sync()
+            for p in fsdp_model.parameters():
+                p.grad = None
+
+        # Forcing a sync surfaces any deferred CUDA errors before teardown.
+        torch.cuda.synchronize()
+        fsdp_model.stop_communication()
