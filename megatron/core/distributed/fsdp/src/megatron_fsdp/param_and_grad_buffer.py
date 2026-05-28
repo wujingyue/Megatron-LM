@@ -29,9 +29,13 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import torch
-from torch.distributed import _coalescing_manager
+from torch.distributed import DeviceMesh, _coalescing_manager
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from .experimental import DBuffer
+from .experimental import Flat as DBufferFlat
+from .experimental import Partial as DBufferPartial
+from .experimental import Replicate as DBufferReplicate
 from .mixed_precision import (
     MixedPrecisionPolicy,
     fp8_discard_transpose_cache,
@@ -279,6 +283,30 @@ def build_data_parallel_buffer_index(
         Tuple[Dict[int, TensorItemIndex], BucketIndex, ShardBucketIndex]: The index
             range of every tensor, every bucket and every in bucket local buffer.
     """
+    if ddp_config.data_parallel_sharding_strategy != "no_shard":
+        layout = DBuffer.compute_layout(elements, dp_size=data_parallel_world_size)
+        item_index_map = {
+            item_id: TensorItemIndex(
+                global_data_index=offset,
+                size=shape.numel(),
+                item_id=item_id,
+                bucket_id=bucket_id,
+                shape=shape,
+            )
+            for item_id, (shape, offset) in enumerate(
+                zip(layout.tensor_shapes, layout.tensor_to_offset, strict=True)
+            )
+        }
+        bucket_index = BucketIndex(
+            bucket_id=bucket_id,
+            global_data_index=0,
+            size=layout.size,
+            items=list(item_index_map.values()),
+        )
+        shard_bucket_index = _get_dp_buffer_shard_bucket_index(
+            bucket_index, is_data_distributed, data_parallel_world_size, data_parallel_rank
+        )
+        return item_index_map, bucket_index, shard_bucket_index
 
     def _pad_if_needed(data_index: int) -> int:
         if ddp_config.data_parallel_sharding_strategy != "no_shard":
@@ -861,6 +889,9 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
+        dbuffer_mesh: Optional[DeviceMesh] = None,
+        dbuffer_mesh_axis: Optional[Any] = None,
+        dbuffer_placements: Optional[Tuple[Any, ...]] = None,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
@@ -872,13 +903,18 @@ class DataParallelBuffer:
         self.dtype = dtype if dtype else next(iter(_param_dtype))
         self.device = device
         self.data_parallel_group = data_parallel_group
+        self.tensor_shapes = tuple(torch.Size(to_local_if_dtensor(p).shape) for p in self.params)
+        self._data_parallel_group_rank = torch.distributed.get_rank(data_parallel_group)
         # NOTE: Specifying dp_rank is a tricky thing. Currently, only full-shard
         # hybrid FSDP needs to do this to set dp rank that is different from the group rank.
         if dp_rank is not None:
             self.dp_rank = dp_rank
         else:
-            self.dp_rank = torch.distributed.get_rank(data_parallel_group)
+            self.dp_rank = self._data_parallel_group_rank
         self.dp_world_size = torch.distributed.get_world_size(data_parallel_group)
+        self.dbuffer_mesh = dbuffer_mesh
+        self.dbuffer_mesh_axis = 0 if dbuffer_mesh_axis is None else dbuffer_mesh_axis
+        self.dbuffer_placements = tuple(dbuffer_placements) if dbuffer_placements else None
         self.temporary_bucket_allocator = (
             temporary_bucket_allocator if temporary_bucket_allocator else TemporaryBucketAllocator()
         )
@@ -924,6 +960,184 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+        self.dbuffer: Optional[DBuffer] = None
+        self._dbuffer_mesh_from_group: Optional[DeviceMesh] = None
+
+    def _get_dbuffer_mesh(self, device: torch.device) -> DeviceMesh:
+        """Return the DeviceMesh used by this DataParallelBuffer's DBuffer view."""
+        if self.dbuffer_mesh is not None:
+            return self.dbuffer_mesh
+        if self._dbuffer_mesh_from_group is None:
+            group = (
+                self.data_parallel_group
+                if self.data_parallel_group is not None
+                else torch.distributed.group.WORLD
+            )
+            self._dbuffer_mesh_from_group = DeviceMesh.from_group(
+                group, device_type=device.type
+            )
+        return self._dbuffer_mesh_from_group
+
+    def _dbuffer_axis_index(self, mesh: DeviceMesh) -> int:
+        """Return the integer mesh-axis index used by DBuffer communication."""
+        axis = self.dbuffer_mesh_axis
+        if isinstance(axis, int):
+            axis_index = axis + mesh.ndim if axis < 0 else axis
+            if axis_index < 0 or axis_index >= mesh.ndim:
+                raise ValueError(f"DBuffer mesh axis {axis} is out of bounds for {mesh.ndim}D mesh.")
+            return axis_index
+
+        dim_names = mesh.mesh_dim_names
+        if dim_names is None or axis not in dim_names:
+            raise ValueError(f"DBuffer mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
+        return dim_names.index(axis)
+
+    def _replace_dbuffer_axis_placement(
+        self, mesh: DeviceMesh, axis_placement: Any, placements: Optional[Tuple[Any, ...]] = None
+    ) -> Tuple[Any, ...]:
+        """Return DBuffer placements with the communication-axis placement replaced."""
+        axis_index = self._dbuffer_axis_index(mesh)
+        if placements is None:
+            placements = tuple(DBufferReplicate() for _ in range(mesh.ndim))
+        placements = list(placements)
+        if len(placements) != mesh.ndim:
+            raise ValueError(f"Expected {mesh.ndim} DBuffer placements, got {len(placements)}.")
+        placements[axis_index] = axis_placement
+        return tuple(placements)
+
+    def _persistent_dbuffer_placements(self, mesh: DeviceMesh) -> Tuple[Any, ...]:
+        """Return placements describing this buffer's persistent storage."""
+        if self.dbuffer_placements is not None:
+            if len(self.dbuffer_placements) != mesh.ndim:
+                raise ValueError(
+                    f"Expected {mesh.ndim} DBuffer placements, got {len(self.dbuffer_placements)}."
+                )
+            return self.dbuffer_placements
+        placement = DBufferFlat() if self.is_data_distributed else DBufferReplicate()
+        return self._replace_dbuffer_axis_placement(mesh, placement)
+
+    def _communication_dbuffer_placements(
+        self, mesh: DeviceMesh, axis_placement: Any
+    ) -> Tuple[Any, ...]:
+        """Return placements for a communication bucket on this buffer's mesh."""
+        return self._replace_dbuffer_axis_placement(
+            mesh, axis_placement, placements=self._persistent_dbuffer_placements(mesh)
+        )
+
+    def _can_create_dbuffer_view(self, data: torch.Tensor) -> bool:
+        """Return whether this buffer's metadata matches a DBuffer view."""
+        if self.ddp_config.data_parallel_sharding_strategy == "no_shard":
+            return False
+        mesh = self._get_dbuffer_mesh(data.device)
+        layout = DBuffer.compute_layout(self.tensor_shapes, dp_size=mesh.size())
+        assert layout.size == self.bucket_index.size, (
+            "DBuffer layout size must match DataParallelBuffer bucket size: "
+            f"{layout.size} != {self.bucket_index.size}."
+        )
+        return True
+
+    def _create_dbuffer_view(
+        self, data: torch.Tensor, placements: Optional[Tuple[Any, ...]] = None
+    ) -> DBuffer:
+        """
+        Create a DBuffer view over already-allocated persistent storage.
+
+        DataParallelBuffer remains the compatibility surface used by the rest of
+        Megatron-FSDP, while DBuffer owns the row-aligned logical tensor layout
+        for DP-padded FSDP sharding modes.
+        """
+        if not self._can_create_dbuffer_view(data):
+            raise RuntimeError("DataParallelBuffer metadata does not match a DBuffer view.")
+
+        mesh = self._get_dbuffer_mesh(data.device)
+        if placements is None:
+            placements = self._persistent_dbuffer_placements(mesh)
+        return DBuffer.from_local(data, mesh, placements, self.tensor_shapes)
+
+    def _create_dbuffer_view_for_bucket(
+        self, bucket: Bucket, axis_placement: Any
+    ) -> Optional[DBuffer]:
+        """Create a DBuffer view over a communication bucket when layouts match."""
+        if not self._can_create_dbuffer_view(bucket.data):
+            return None
+        mesh = self._get_dbuffer_mesh(bucket.data.device)
+        placements = self._communication_dbuffer_placements(mesh, axis_placement)
+        return self._create_dbuffer_view(bucket.data, placements)
+
+    def _get_virtual_shard_dbuffer(self) -> DBuffer:
+        """Return a Flat DBuffer view of this buffer's rank-local DP shard."""
+        if self.dbuffer is None:
+            raise RuntimeError("DataParallelBuffer data has not been initialized.")
+        if self.is_data_distributed:
+            return self.dbuffer
+        return self.dbuffer.scatter(self.dbuffer_mesh_axis, DBufferFlat())
+
+    def all_gather_into_bucket(
+        self, bucket: Bucket, async_op: bool = False
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.distributed.Work]]]:
+        """All-gather this buffer's local DP shard into a full communication bucket."""
+        output_buffer = self._create_dbuffer_view_for_bucket(bucket, DBufferReplicate())
+        if output_buffer is None or self.dbuffer is None:
+            return None
+
+        input_buffer = self._get_virtual_shard_dbuffer()
+        result = input_buffer.allgather(
+            self.dbuffer_mesh_axis, out=output_buffer, async_op=async_op
+        )
+        if async_op:
+            _, work = result
+            return bucket.data, work
+        return bucket.data, None
+
+    def reduce_scatter_bucket_into_shard(
+        self,
+        bucket: Bucket,
+        reduce_op: torch.distributed.ReduceOp.RedOpType,
+        async_op: bool = False,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.distributed.Work]]]:
+        """Reduce-scatter a full communication bucket into this rank's bucket shard."""
+        input_buffer = self._create_dbuffer_view_for_bucket(bucket, DBufferPartial(reduce_op))
+        if input_buffer is None:
+            return None
+
+        shard = self.get_shard_from_bucket(bucket)
+        mesh = input_buffer.mesh
+        output_placements = self._persistent_dbuffer_placements(mesh)
+        output_buffer = DBuffer.from_local(
+            shard,
+            mesh,
+            output_placements,
+            self.tensor_shapes,
+        )
+        axis_index = self._dbuffer_axis_index(mesh)
+        result = input_buffer.reduce_scatter(
+            self.dbuffer_mesh_axis,
+            output_placements[axis_index],
+            out=output_buffer,
+            async_op=async_op,
+        )
+        if async_op:
+            _, work = result
+            return shard, work
+        return shard, None
+
+    def all_reduce_bucket(
+        self,
+        bucket: Bucket,
+        reduce_op: torch.distributed.ReduceOp.RedOpType,
+        async_op: bool = False,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.distributed.Work]]]:
+        """All-reduce a full communication bucket in place."""
+        input_buffer = self._create_dbuffer_view_for_bucket(bucket, DBufferPartial(reduce_op))
+        output_buffer = self._create_dbuffer_view_for_bucket(bucket, DBufferReplicate())
+        if input_buffer is None or output_buffer is None:
+            return None
+
+        result = input_buffer.allreduce(self.dbuffer_mesh_axis, out=output_buffer, async_op=async_op)
+        if async_op:
+            _, work = result
+            return bucket.data, work
+        return bucket.data, None
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
@@ -934,6 +1148,8 @@ class DataParallelBuffer:
             data.numel() == self.data_size
         ), f"Data size mismatch: {data.numel()} != {self.data_size}"
         self.data = data
+        if self._can_create_dbuffer_view(data):
+            self.dbuffer = self._create_dbuffer_view(data)
 
     def fetch_bucket(
         self, dtype: Optional[torch.dtype] = None, set_param_data: bool = False
@@ -1202,6 +1418,10 @@ class DataParallelBuffer:
         if is_float8tensor(item_data):
             item_data = fp8_get_raw_data(item_data, self.is_transpose_buffer)
 
+        if self.dbuffer is not None:
+            self.dbuffer.set_tensor(item_id, item_data)
+            return
+
         if self.is_data_distributed:
             # Get the coordinates of the slice of the item that is contained in this shard.
             slice_start, slice_end = self._get_item_slice_in_shard(item_id)
@@ -1234,6 +1454,10 @@ class DataParallelBuffer:
         Returns:
             torch.Tensor: The retrieved tensor item.
         """
+        if self.dbuffer is not None:
+            dbuffer = self._get_virtual_shard_dbuffer() if only_shard else self.dbuffer
+            return dbuffer.get_tensor(item_id).view(-1)
+
         if only_shard:
             # Get segment of the item saved in the shard associated with this rank.
             # Used in situations where the buffer is unsharded but another buffer
@@ -1275,6 +1499,9 @@ class DataParallelBuffer:
         """
         Get the shard or virtual shard of the data persistently stored in this buffer.
         """
+        if self.dbuffer is not None:
+            return self._get_virtual_shard_dbuffer().local_buffer
+
         index = self.shard_bucket_index
         # If the buffer is sharded, return the shard stored in this buffer.
         # Otherwise, return the virtual shard of the bucket associated with this buffer,
@@ -2175,6 +2402,7 @@ class ParamAndGradBuffer:
         # For all bucket groups (partitioned parameter groups)...
         for group_id, group in enumerate(self.parameter_groups):
             main_buf_extra_kwargs = {}
+            hfsdp_helper_dbuffer_kwargs = {}
             if should_create_hfsdp_helper_buffers:
                 # DP-Outer + DP-Shard
                 main_buf_dp_group = self.dist_index.get_dp_group(
@@ -2187,6 +2415,22 @@ class ParamAndGradBuffer:
                 main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank(
                     is_expert_parallel=group.is_expert_param
                 )
+                dp_mesh = self.dist_index.get_submesh(
+                    (self.dist_index.dp_outer_dim, self.dist_index.dp_shard_dim),
+                    is_expert_parallel=group.is_expert_param,
+                )
+                main_buf_extra_kwargs["dbuffer_mesh"] = dp_mesh
+                main_buf_extra_kwargs["dbuffer_mesh_axis"] = self.dist_index.dp_outer_dim
+                main_buf_extra_kwargs["dbuffer_placements"] = tuple(
+                    DBufferFlat() for _ in range(dp_mesh.ndim)
+                )
+                helper_placements = [DBufferReplicate() for _ in range(dp_mesh.ndim)]
+                helper_placements[dp_mesh.mesh_dim_names.index(self.dist_index.dp_shard_dim)] = (
+                    DBufferFlat()
+                )
+                hfsdp_helper_dbuffer_kwargs["dbuffer_mesh"] = dp_mesh
+                hfsdp_helper_dbuffer_kwargs["dbuffer_mesh_axis"] = self.dist_index.dp_shard_dim
+                hfsdp_helper_dbuffer_kwargs["dbuffer_placements"] = tuple(helper_placements)
             else:
                 # DP-Shard only, since we're not sharding on DP-Outer.
                 main_buf_dp_group = self.dist_index.get_fsdp_group(
@@ -2339,6 +2583,7 @@ class ParamAndGradBuffer:
                     inner_dp_group=inner_dp_group,
                     is_data_distributed=is_main_weight_buffer_distributed
                     and inner_dp_group.size() > 1,
+                    dbuffer_kwargs=hfsdp_helper_dbuffer_kwargs,
                 )
 
                 if group.transpose_weight_buffer is not None:
@@ -2347,6 +2592,7 @@ class ParamAndGradBuffer:
                         inner_dp_group=inner_dp_group,
                         is_data_distributed=is_main_weight_buffer_distributed
                         and inner_dp_group.size() > 1,
+                        dbuffer_kwargs=hfsdp_helper_dbuffer_kwargs,
                     )
 
                 if should_create_grad_buffer_or_main_weight_buffer:
@@ -2355,6 +2601,7 @@ class ParamAndGradBuffer:
                         inner_dp_group=inner_dp_group,
                         is_data_distributed=is_grad_buffer_distributed
                         and inner_dp_group.size() > 1,
+                        dbuffer_kwargs=hfsdp_helper_dbuffer_kwargs,
                     )
                     buffer_size[group.main_grad_buffer.dtype] -= group.main_grad_buffer.data_size
                     buffer_size[group.main_grad_buffer.dtype] += group.hfsdp_helper_gbuf.data_size
@@ -3178,13 +3425,19 @@ class ParamAndGradBuffer:
             for buf in [g.model_weight_buffer, g.transpose_weight_buffer]:
                 if buf is None:
                     continue
-                shard = buf.get_shard_from_local_buffer()
-                all_gather_handler = torch.distributed.all_gather_into_tensor(
-                    output_tensor=buf.data,
-                    input_tensor=shard,
-                    group=buf.data_parallel_group,
-                    async_op=async_op,
+                gathered = buf.all_gather_into_bucket(
+                    Bucket(data=buf.data), async_op=async_op
                 )
+                if gathered is None:
+                    shard = buf.get_shard_from_local_buffer()
+                    all_gather_handler = torch.distributed.all_gather_into_tensor(
+                        output_tensor=buf.data,
+                        input_tensor=shard,
+                        group=buf.data_parallel_group,
+                        async_op=async_op,
+                    )
+                else:
+                    _, all_gather_handler = gathered
                 if async_op:
                     all_gather_ops.append(all_gather_handler)
 
@@ -3213,13 +3466,19 @@ class ParamAndGradBuffer:
             if self.ddp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
-            reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
-                output=gbuf.get_shard_from_local_buffer(),
-                input=gbuf.data,
-                op=reduce_op,
-                group=g.main_grad_buffer.data_parallel_group,
-                async_op=async_op,
+            reduced_shard = gbuf.reduce_scatter_bucket_into_shard(
+                Bucket(data=gbuf.data), reduce_op=reduce_op, async_op=async_op
             )
+            if reduced_shard is None:
+                reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
+                    output=gbuf.get_shard_from_local_buffer(),
+                    input=gbuf.data,
+                    op=reduce_op,
+                    group=g.main_grad_buffer.data_parallel_group,
+                    async_op=async_op,
+                )
+            else:
+                _, reduce_scatter_handler = reduced_shard
 
             if async_op:
                 reduce_scatter_ops.append(reduce_scatter_handler)
@@ -3253,9 +3512,15 @@ class ParamAndGradBuffer:
             if self.ddp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
-            all_reduce_handler = torch.distributed.all_reduce(
-                gbuf.data, op=reduce_op, group=gbuf.data_parallel_group, async_op=async_op
+            all_reduced = gbuf.all_reduce_bucket(
+                Bucket(data=gbuf.data), reduce_op=reduce_op, async_op=async_op
             )
+            if all_reduced is None:
+                all_reduce_handler = torch.distributed.all_reduce(
+                    gbuf.data, op=reduce_op, group=gbuf.data_parallel_group, async_op=async_op
+                )
+            else:
+                _, all_reduce_handler = all_reduced
             if async_op:
                 all_reduce_ops.append(all_reduce_handler)
 
@@ -3267,6 +3532,7 @@ def _create_hfsdp_helper_buffer(
     dp_buffer: DataParallelBuffer,
     inner_dp_group: torch.distributed.ProcessGroup,
     is_data_distributed: bool,
+    dbuffer_kwargs: Optional[Dict[str, Any]] = None,
 ) -> DataParallelBuffer:
     """
     Create a Hybrid-FSDP helper DataParallelBuffer on the inner-DP group.
@@ -3290,6 +3556,8 @@ def _create_hfsdp_helper_buffer(
     is_data_distributed : bool
         Whether the underlying data in this helper buffer is sharded
         across ranks in `inner_dp_group`.
+    dbuffer_kwargs : Optional[Dict[str, Any]]
+        DBuffer mesh, axis, and placement metadata for the helper view.
 
     Returns
     =======
@@ -3321,6 +3589,7 @@ def _create_hfsdp_helper_buffer(
             data_parallel_world_size=inner_dp_group.size(),
             data_parallel_rank=inner_dp_group.rank(),
         ),
+        **(dbuffer_kwargs or {}),
     )
 
     return helper_buffer
@@ -3656,9 +3925,13 @@ class GradReducePipeline:
                     # Reduce-scatter or all-reduce the unsharded gradient.
                     if ddp_config.data_parallel_sharding_strategy == "no_shard":
                         # All-reduce un-sharded gradients from every rank.
-                        torch.distributed.all_reduce(
-                            unreduced_grad, op=reduce_op, group=gbuf.data_parallel_group
+                        all_reduced = gbuf.all_reduce_bucket(
+                            unreduced_grad_bucket, reduce_op=reduce_op
                         )
+                        if all_reduced is None:
+                            torch.distributed.all_reduce(
+                                unreduced_grad, op=reduce_op, group=gbuf.data_parallel_group
+                            )
                         if custom_grad_comm_dtype:
                             # Reduction used a temporary communication buffer.
                             grad_accum_closure.append(
@@ -3666,16 +3939,22 @@ class GradReducePipeline:
                                 (gbuf.data, unreduced_grad)
                             )
                     else:
-                        # Slice a gradient shard from the communication bucket.
-                        grad_shard = gbuf.get_shard_from_bucket(unreduced_grad_bucket)
-
-                        # Execute the reduce-scatter collective.
-                        torch.distributed.reduce_scatter_tensor(
-                            output=grad_shard,
-                            input=unreduced_grad,
-                            op=reduce_op,
-                            group=gbuf.data_parallel_group,
+                        reduced_shard = gbuf.reduce_scatter_bucket_into_shard(
+                            unreduced_grad_bucket, reduce_op=reduce_op
                         )
+                        if reduced_shard is None:
+                            # Slice a gradient shard from the communication bucket.
+                            grad_shard = gbuf.get_shard_from_bucket(unreduced_grad_bucket)
+
+                            # Execute the reduce-scatter collective.
+                            torch.distributed.reduce_scatter_tensor(
+                                output=grad_shard,
+                                input=unreduced_grad,
+                                op=reduce_op,
+                                group=gbuf.data_parallel_group,
+                            )
+                        else:
+                            grad_shard, _ = reduced_shard
 
                         # Track closure tasks to accumulate the reduced gradient shard.
                         # NOTE: If the gradient buffer is unsharded and no communication
@@ -4246,12 +4525,16 @@ class AllGatherPipeline:
 
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
-        param_gather_event = torch.distributed.all_gather_into_tensor(
-            output_tensor=bucket.data,
-            input_tensor=wbuf.get_shard_from_local_buffer(),
-            group=wbuf.data_parallel_group,
-            async_op=True,
-        )
+        gathered = wbuf.all_gather_into_bucket(bucket, async_op=True)
+        if gathered is None:
+            param_gather_event = torch.distributed.all_gather_into_tensor(
+                output_tensor=bucket.data,
+                input_tensor=wbuf.get_shard_from_local_buffer(),
+                group=wbuf.data_parallel_group,
+                async_op=True,
+            )
+        else:
+            _, param_gather_event = gathered
 
         def get_closure(bucket_id, bwd):
             @torch.no_grad()

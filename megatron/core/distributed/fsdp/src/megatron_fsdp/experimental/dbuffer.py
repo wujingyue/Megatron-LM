@@ -38,7 +38,11 @@ class GlobalLayout:
     tensor_to_offset: tuple[int, ...]
     size: int
 
-    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
+    def get_local_range(
+        self,
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+    ) -> tuple[int, int]:
         """Return this rank's local element offset and length for ``placements``."""
         offset = 0
         numel = self.size
@@ -80,11 +84,6 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 
 def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
     """Compute global tensor element offsets and padded size.
-
-    This is a DBuffer-specific reimplementation of
-    ``param_and_grad_buffer.build_data_parallel_buffer_index``. It keeps only
-    the global offset construction and final DP-LCM padding; DBuffer derives
-    rank-local slices later through DTensor placements.
 
     The computed layout is compatible with Flat, TensorAtomic, and BlockAtomic,
     even though the latter two are not implemented.
@@ -210,6 +209,11 @@ class DBuffer:
     offset: int
     local_buffer: torch.Tensor
 
+    @staticmethod
+    def compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
+        """Compute the global row-aligned layout for DBuffer logical tensors."""
+        return _compute_layout(shapes, dp_size)
+
     def __init__(
         self,
         mesh: DeviceMesh,
@@ -238,7 +242,7 @@ class DBuffer:
         self.placements = placements
 
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        self.layout = _compute_layout(tensor_shapes, dp_size=self.mesh.size())
+        self.layout = self.compute_layout(tensor_shapes, dp_size=self.mesh.size())
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
@@ -277,7 +281,7 @@ class DBuffer:
             raise ValueError("local_buffer must be a flat 1D tensor.")
 
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        layout = _compute_layout(tensor_shapes, dp_size=mesh.size())
+        layout = cls.compute_layout(tensor_shapes, dp_size=mesh.size())
         offset, local_numel = layout.get_local_range(mesh, placements)
         if local_buffer.numel() != local_numel:
             raise ValueError(
@@ -433,7 +437,9 @@ class DBuffer:
             f"{axis}: {old_placement!r} -> {new_placement!r}."
         )
 
-    def allgather(self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None) -> "DBuffer":
+    def allgather(
+        self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None, async_op: bool = False
+    ) -> "DBuffer | tuple[DBuffer, dist.Work]":
         """All-gather a Flat axis into Replicate placement."""
         axis = _axis_index(self.mesh, mesh_axis)
         if not isinstance(self.placements[axis], Flat):
@@ -443,14 +449,19 @@ class DBuffer:
         placements[axis] = Replicate()
         validate_placements(placements)
         out = self._create_or_validate_out(placements, out)
-        dist.all_gather_into_tensor(
+        work = dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
             input_tensor=self.local_buffer,
             group=self.mesh.get_group(axis),
+            async_op=async_op,
         )
+        if async_op:
+            return out, work
         return out
 
-    def allreduce(self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None) -> "DBuffer":
+    def allreduce(
+        self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None, async_op: bool = False
+    ) -> "DBuffer | tuple[DBuffer, dist.Work]":
         """All-reduce a Partial axis into Replicate placement."""
         axis = _axis_index(self.mesh, mesh_axis)
         partial_placement = self.placements[axis]
@@ -461,16 +472,24 @@ class DBuffer:
         placements[axis] = Replicate()
         out = self._create_or_validate_out(placements, out)
         out.local_buffer.copy_(self.local_buffer)
-        dist.all_reduce(
+        work = dist.all_reduce(
             out.local_buffer,
             op=partial_placement.reduce_op,
             group=self.mesh.get_group(axis),
+            async_op=async_op,
         )
+        if async_op:
+            return out, work
         return out
 
     def reduce_scatter(
-        self, mesh_axis: MeshAxis, new_placement: Placement, *, out: "DBuffer | None" = None
-    ) -> "DBuffer":
+        self,
+        mesh_axis: MeshAxis,
+        new_placement: Placement,
+        *,
+        out: "DBuffer | None" = None,
+        async_op: bool = False,
+    ) -> "DBuffer | tuple[DBuffer, dist.Work]":
         """Reduce-scatter a Partial axis into ``new_placement``."""
         axis = _axis_index(self.mesh, mesh_axis)
         if not isinstance(new_placement, Flat):
@@ -483,12 +502,15 @@ class DBuffer:
         placements[axis] = new_placement
         validate_placements(placements)
         out = self._create_or_validate_out(placements, out)
-        dist.reduce_scatter_tensor(
+        work = dist.reduce_scatter_tensor(
             output=out.local_buffer,
             input=self.local_buffer,
             op=partial_placement.reduce_op,
             group=self.mesh.get_group(axis),
+            async_op=async_op,
         )
+        if async_op:
+            return out, work
         return out
 
     def scatter(
@@ -522,7 +544,12 @@ class DBuffer:
             raise RuntimeError("scatter() destination is not contained in the source local buffer.")
         local_slice = self.local_buffer.narrow(0, local_buffer_offset, destination_numel)
         if out is None:
-            return DBuffer.from_local(local_slice, self.mesh, placements, self.layout.tensor_shapes)
+            return DBuffer.from_local(
+                local_slice,
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+            )
 
         out.local_buffer.copy_(local_slice)
         return out
@@ -555,6 +582,37 @@ class DBuffer:
             )
         local_shape = torch.Size((local_numel // row_size, *shape[1:]))
         return self.local_buffer.narrow(0, local_buffer_offset, local_numel).view(local_shape)
+
+    def set_tensor(self, index: int, tensor: torch.Tensor) -> None:
+        """Copy this rank's local slice of ``tensor`` into logical tensor ``index``."""
+        shape = self.layout.tensor_shapes[index]
+        if tensor.numel() != shape.numel():
+            raise ValueError(
+                f"Expected tensor {index} with {shape.numel()} elements, got {tensor.numel()}."
+            )
+
+        offset = self.layout.tensor_to_offset[index]
+        numel = shape.numel()
+
+        tensor_start = offset
+        tensor_end = offset + numel
+        overlap_start = max(tensor_start, self.offset)
+        overlap_end = min(tensor_end, self.offset + self.local_buffer.numel())
+        if overlap_end <= overlap_start:
+            return
+
+        row_size = _non_leading_numel(shape)
+        local_numel = overlap_end - overlap_start
+        if (overlap_start - tensor_start) % row_size != 0 or local_numel % row_size != 0:
+            raise RuntimeError(
+                f"Local tensor shard for tensor {index} does not preserve dim-0 boundaries."
+            )
+
+        source_offset = overlap_start - tensor_start
+        destination_offset = overlap_start - self.offset
+        self.local_buffer.narrow(0, destination_offset, local_numel).copy_(
+            tensor.contiguous().view(-1).narrow(0, source_offset, local_numel)
+        )
 
     def get_dtensor(self, index: int) -> DTensor:
         """Return logical tensor ``index`` as a DTensor."""

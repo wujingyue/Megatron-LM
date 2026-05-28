@@ -11,11 +11,18 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import (
     DBuffer,
     Flat,
     Partial,
     Replicate,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+    Bucket,
+    DataParallelBuffer,
+    _get_dp_buffer_shard_bucket_index,
+    build_data_parallel_buffer_index,
 )
 
 
@@ -61,6 +68,10 @@ def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
 def _assert_dbuffer_contains_tensors(buffer: DBuffer, expected: Iterable[torch.Tensor]) -> None:
     for index, tensor in enumerate(expected):
         torch.testing.assert_close(buffer.get_tensor(index), tensor)
+
+
+def _dbuffer_ddp_config() -> DistributedDataParallelConfig:
+    return DistributedDataParallelConfig(data_parallel_sharding_strategy="optim_grads_params")
 
 
 @pytest.mark.distributed
@@ -151,6 +162,30 @@ def test_compute_layout_fills_lcm_padding_gaps(setup: DistributedSetup):
 
 
 @pytest.mark.distributed
+def test_data_parallel_buffer_index_uses_dbuffer_layout(setup: DistributedSetup):
+    """MFSDP DataParallelBuffer indexing follows the DBuffer row-aligned layout."""
+    if setup.world_size < 2:
+        pytest.skip("DataParallelBuffer DBuffer layout test requires at least 2 ranks.")
+
+    shapes = [torch.Size((4, 4)), torch.Size((1, 6))]
+
+    item_index_map, bucket_index, shard_bucket_index = build_data_parallel_buffer_index(
+        shapes,
+        data_parallel_rank=setup.rank,
+        data_parallel_world_size=setup.world_size,
+        is_data_distributed=True,
+        ddp_config=_dbuffer_ddp_config(),
+        bucket_id=3,
+        chunk_size_factor=12,
+    )
+
+    assert item_index_map[0].global_data_index == 0
+    assert item_index_map[1].global_data_index == 18
+    assert bucket_index.size % (12 * setup.world_size) == 0
+    assert shard_bucket_index.size == bucket_index.size // setup.world_size
+
+
+@pytest.mark.distributed
 def test_constructor_allocates_local_buffer(setup: DistributedSetup):
     """DBuffer allocates local storage from shape, mesh, placement, dtype, and device."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
@@ -228,6 +263,327 @@ def test_distribute_tensors_moves_inputs_to_mesh_device(setup: DistributedSetup)
 
     assert buffer.local_buffer.device == setup.device
     _assert_dbuffer_contains_tensors(buffer, [tensor.to(setup.device) for tensor in tensors])
+
+
+@pytest.mark.distributed
+def test_data_parallel_buffer_wraps_persistent_storage_with_dbuffer(setup: DistributedSetup):
+    """Sharded MFSDP DataParallelBuffer uses DBuffer for persistent item storage."""
+    if setup.world_size < 2:
+        pytest.skip("DataParallelBuffer DBuffer storage test requires at least 2 ranks.")
+
+    tensors = [
+        torch.arange(16, dtype=torch.float32, device=setup.device).reshape(4, 4),
+        torch.arange(6, dtype=torch.float32, device=setup.device).reshape(1, 6) + 100,
+    ]
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    params = [torch.nn.Parameter(tensor.clone()) for tensor in tensors]
+    buffer = DataParallelBuffer(
+        _dbuffer_ddp_config(),
+        params,
+        is_data_distributed=True,
+        bucket_id=0,
+        device=setup.device,
+        data_parallel_group=mesh.get_group(),
+        chunk_size_factor=12,
+    )
+    buffer.init_data(torch.empty(buffer.data_size, dtype=torch.float32, device=setup.device))
+
+    assert buffer.dbuffer is not None
+    assert buffer.dbuffer.placements == (Flat(),)
+
+    for item_id, tensor in enumerate(tensors):
+        buffer.set_item(item_id, tensor)
+
+    replicated_buffer = buffer.dbuffer.allgather(0)
+    _assert_dbuffer_contains_tensors(replicated_buffer, tensors)
+    assert buffer.get_shard_from_local_buffer().data_ptr() == buffer.dbuffer.local_buffer.data_ptr()
+
+
+@pytest.mark.distributed
+def test_data_parallel_buffer_uses_dbuffer_for_virtual_shards(setup: DistributedSetup):
+    """Unsharded MFSDP buffers expose virtual DP shards through DBuffer scatter."""
+    if setup.world_size < 2:
+        pytest.skip("DataParallelBuffer virtual shard test requires at least 2 ranks.")
+
+    tensors = [
+        torch.arange(16, dtype=torch.float32, device=setup.device).reshape(4, 4),
+        torch.arange(6, dtype=torch.float32, device=setup.device).reshape(1, 6) + 100,
+    ]
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    params = [torch.nn.Parameter(tensor.clone()) for tensor in tensors]
+    buffer = DataParallelBuffer(
+        _dbuffer_ddp_config(),
+        params,
+        is_data_distributed=False,
+        bucket_id=0,
+        device=setup.device,
+        data_parallel_group=mesh.get_group(),
+        chunk_size_factor=12,
+    )
+    buffer.init_data(torch.empty(buffer.data_size, dtype=torch.float32, device=setup.device))
+
+    assert buffer.dbuffer is not None
+    assert buffer.dbuffer.placements == (Replicate(),)
+
+    for item_id, tensor in enumerate(tensors):
+        buffer.set_item(item_id, tensor)
+        torch.testing.assert_close(buffer.get_item(item_id), tensor.flatten(), rtol=0, atol=0)
+
+    flat_view = buffer.dbuffer.scatter(0, Flat())
+    torch.testing.assert_close(buffer.get_shard_from_local_buffer(), flat_view.local_buffer)
+    for item_id in range(len(tensors)):
+        torch.testing.assert_close(
+            buffer.get_item(item_id, only_shard=True), flat_view.get_tensor(item_id).view(-1)
+        )
+
+
+@pytest.mark.distributed
+def test_data_parallel_buffer_all_gather_uses_dbuffer_primitive(setup: DistributedSetup):
+    """MFSDP DataParallelBuffer all-gathers through DBuffer."""
+    if setup.world_size < 2:
+        pytest.skip("DataParallelBuffer DBuffer all-gather test requires at least 2 ranks.")
+
+    tensors = _same_tensors_on_all_ranks(setup.device)
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    params = [torch.nn.Parameter(tensor.clone()) for tensor in tensors]
+    buffer = DataParallelBuffer(
+        _dbuffer_ddp_config(),
+        params,
+        is_data_distributed=True,
+        bucket_id=0,
+        device=setup.device,
+        data_parallel_group=mesh.get_group(),
+    )
+    buffer.init_data(torch.empty(buffer.data_size, dtype=torch.float32, device=setup.device))
+    for item_id, tensor in enumerate(tensors):
+        buffer.set_item(item_id, tensor)
+    bucket = buffer.allocate_bucket_storage(dtype=buffer.dtype, device=setup.device)
+
+    gathered = buffer.all_gather_into_bucket(bucket, async_op=True)
+    assert gathered is not None
+    _, work = gathered
+    assert work is not None
+    work.wait()
+
+    bucket_buffer = DBuffer.from_local(bucket.data, mesh, [Replicate()], [t.shape for t in tensors])
+    _assert_dbuffer_contains_tensors(bucket_buffer, tensors)
+
+    sync_bucket = buffer.allocate_bucket_storage(dtype=buffer.dtype, device=setup.device)
+    gathered = buffer.all_gather_into_bucket(sync_bucket, async_op=False)
+    assert gathered is not None
+    gathered_data, work = gathered
+    assert work is None
+    assert gathered_data.data_ptr() == sync_bucket.data.data_ptr()
+    sync_bucket_buffer = DBuffer.from_local(
+        sync_bucket.data, mesh, [Replicate()], [t.shape for t in tensors]
+    )
+    _assert_dbuffer_contains_tensors(sync_bucket_buffer, tensors)
+
+
+@pytest.mark.distributed
+def test_data_parallel_buffer_reduce_scatter_uses_dbuffer_primitive(setup: DistributedSetup):
+    """MFSDP DataParallelBuffer reduce-scatters through DBuffer."""
+    if setup.world_size < 2:
+        pytest.skip("DataParallelBuffer DBuffer reduce-scatter test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    rank_scale = float(setup.rank + 1)
+    tensors = [
+        torch.full((5, 3), rank_scale, dtype=torch.float32, device=setup.device),
+        torch.full((4,), rank_scale * 10, dtype=torch.float32, device=setup.device),
+    ]
+    params = [torch.nn.Parameter(torch.empty_like(tensor)) for tensor in tensors]
+    buffer = DataParallelBuffer(
+        _dbuffer_ddp_config(),
+        params,
+        is_data_distributed=True,
+        bucket_id=0,
+        device=setup.device,
+        data_parallel_group=mesh.get_group(),
+    )
+    buffer.init_data(torch.empty(buffer.data_size, dtype=torch.float32, device=setup.device))
+    bucket = buffer.allocate_bucket_storage(dtype=buffer.dtype, device=setup.device)
+    source_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+    bucket.data.copy_(source_buffer.local_buffer)
+
+    reduced = buffer.reduce_scatter_bucket_into_shard(
+        bucket, reduce_op=dist.ReduceOp.SUM, async_op=True
+    )
+    assert reduced is not None
+    shard, work = reduced
+    assert work is not None
+    work.wait()
+
+    sharded_buffer = DBuffer.from_local(shard, mesh, [Flat()], [tensor.shape for tensor in tensors])
+    replicated_buffer = sharded_buffer.allgather(0)
+    scale_sum = float(setup.world_size * (setup.world_size + 1) // 2)
+    expected = [
+        torch.full((5, 3), scale_sum, dtype=torch.float32, device=setup.device),
+        torch.full((4,), scale_sum * 10, dtype=torch.float32, device=setup.device),
+    ]
+    _assert_dbuffer_contains_tensors(replicated_buffer, expected)
+
+
+@pytest.mark.distributed
+def test_data_parallel_buffer_all_reduce_uses_dbuffer_primitive(setup: DistributedSetup):
+    """MFSDP DataParallelBuffer all-reduces through DBuffer."""
+    if setup.world_size < 2:
+        pytest.skip("DataParallelBuffer DBuffer all-reduce test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    rank_scale = float(setup.rank + 1)
+    tensors = [
+        torch.full((5, 3), rank_scale, dtype=torch.float32, device=setup.device),
+        torch.full((4,), rank_scale * 10, dtype=torch.float32, device=setup.device),
+    ]
+    params = [torch.nn.Parameter(torch.empty_like(tensor)) for tensor in tensors]
+    buffer = DataParallelBuffer(
+        _dbuffer_ddp_config(),
+        params,
+        is_data_distributed=False,
+        bucket_id=0,
+        device=setup.device,
+        data_parallel_group=mesh.get_group(),
+    )
+    buffer.init_data(torch.empty(buffer.data_size, dtype=torch.float32, device=setup.device))
+    source_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+    buffer.data.copy_(source_buffer.local_buffer)
+
+    all_reduced = buffer.all_reduce_bucket(
+        Bucket(data=buffer.data), reduce_op=dist.ReduceOp.SUM, async_op=True
+    )
+    assert all_reduced is not None
+    _, work = all_reduced
+    assert work is not None
+    work.wait()
+
+    scale_sum = float(setup.world_size * (setup.world_size + 1) // 2)
+    expected = [
+        torch.full((5, 3), scale_sum, dtype=torch.float32, device=setup.device),
+        torch.full((4,), scale_sum * 10, dtype=torch.float32, device=setup.device),
+    ]
+    _assert_dbuffer_contains_tensors(buffer.dbuffer, expected)
+
+    buffer.data.copy_(source_buffer.local_buffer)
+    all_reduced = buffer.all_reduce_bucket(
+        Bucket(data=buffer.data), reduce_op=dist.ReduceOp.SUM, async_op=False
+    )
+    assert all_reduced is not None
+    reduced_data, work = all_reduced
+    assert work is None
+    assert reduced_data.data_ptr() == buffer.data.data_ptr()
+    _assert_dbuffer_contains_tensors(buffer.dbuffer, expected)
+
+
+@pytest.mark.distributed
+def test_data_parallel_buffer_hfsdp_helper_uses_2d_mesh_inner_axis(
+    setup: DistributedSetup,
+):
+    """HFSDP helper buffers use the full DP mesh and communicate along inner DP."""
+    if setup.world_size < 4 or setup.world_size % 2 != 0:
+        pytest.skip("HFSDP helper DBuffer test requires an even world size of at least 4.")
+
+    tensors = [
+        torch.arange(16, dtype=torch.float32, device=setup.device).reshape(4, 4),
+        torch.arange(6, dtype=torch.float32, device=setup.device).reshape(1, 6) + 100,
+    ]
+    shapes = [tensor.shape for tensor in tensors]
+    mesh = init_device_mesh(
+        setup.device.type, (2, setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    item_index_map, bucket_index, _ = build_data_parallel_buffer_index(
+        shapes,
+        data_parallel_rank=0,
+        data_parallel_world_size=mesh.size(),
+        is_data_distributed=True,
+        ddp_config=_dbuffer_ddp_config(),
+        bucket_id=0,
+        chunk_size_factor=12,
+    )
+    shard_bucket_index = _get_dp_buffer_shard_bucket_index(
+        bucket_index,
+        is_data_distributed=True,
+        data_parallel_world_size=mesh.size("dp_inner"),
+        data_parallel_rank=mesh.get_local_rank("dp_inner"),
+    )
+    params = [torch.nn.Parameter(tensor.clone()) for tensor in tensors]
+    buffer = DataParallelBuffer(
+        _dbuffer_ddp_config(),
+        params,
+        is_data_distributed=True,
+        bucket_id=0,
+        device=setup.device,
+        data_parallel_group=mesh.get_group("dp_inner"),
+        chunk_size_factor=12,
+        item_index_map=item_index_map,
+        bucket_index=bucket_index,
+        shard_bucket_index=shard_bucket_index,
+        dbuffer_mesh=mesh,
+        dbuffer_mesh_axis="dp_inner",
+        dbuffer_placements=(Replicate(), Flat()),
+    )
+    buffer.init_data(torch.empty(buffer.data_size, dtype=torch.float32, device=setup.device))
+
+    assert buffer.dbuffer is not None
+    assert buffer.dbuffer.mesh.ndim == 2
+    assert buffer.dbuffer.placements == (Replicate(), Flat())
+    assert buffer.dbuffer.layout.size == bucket_index.size
+    assert buffer.data_size == bucket_index.size // mesh.size("dp_inner")
+    assert buffer.dbuffer.local_buffer.data_ptr() == buffer.data.data_ptr()
+    for item_id, tensor in enumerate(tensors):
+        buffer.set_item(item_id, tensor)
+
+    bucket = buffer.allocate_bucket_storage(dtype=buffer.dtype, device=setup.device)
+    gathered = buffer.all_gather_into_bucket(bucket, async_op=True)
+    assert gathered is not None
+    _, work = gathered
+    assert work is not None
+    work.wait()
+
+    bucket_buffer = DBuffer.from_local(bucket.data, mesh, [Replicate(), Replicate()], shapes)
+    _assert_dbuffer_contains_tensors(bucket_buffer, tensors)
+
+
+@pytest.mark.distributed
+def test_data_parallel_buffer_full_dp_uses_2d_mesh_logical_rank(
+    setup: DistributedSetup,
+):
+    """Full-DP HFSDP buffers derive logical rank from 2D mesh coordinates."""
+    if setup.world_size < 4 or setup.world_size % 2 != 0:
+        pytest.skip("HFSDP full-DP DBuffer test requires an even world size of at least 4.")
+
+    tensors = _same_tensors_on_all_ranks(setup.device)
+    mesh = init_device_mesh(
+        setup.device.type, (2, setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    params = [torch.nn.Parameter(tensor.clone()) for tensor in tensors]
+    logical_dp_rank = (
+        mesh.get_local_rank("dp_inner") * mesh.size("dp_outer")
+        + mesh.get_local_rank("dp_outer")
+    )
+    buffer = DataParallelBuffer(
+        _dbuffer_ddp_config(),
+        params,
+        is_data_distributed=True,
+        bucket_id=0,
+        device=setup.device,
+        data_parallel_group=dist.group.WORLD,
+        dp_rank=logical_dp_rank,
+        dbuffer_mesh=mesh,
+        dbuffer_mesh_axis="dp_outer",
+        dbuffer_placements=(Flat(), Flat()),
+    )
+    buffer.init_data(torch.empty(buffer.data_size, dtype=torch.float32, device=setup.device))
+
+    assert buffer.dbuffer is not None
+    assert buffer.dbuffer.placements == (Flat(), Flat())
+    assert buffer.dbuffer.offset == buffer.shard_bucket_index.bucket_data_index
+
+    for item_id, tensor in enumerate(tensors):
+        buffer.set_item(item_id, tensor)
+
+    replicated_buffer = buffer.dbuffer.allgather("dp_outer").allgather("dp_inner")
+    _assert_dbuffer_contains_tensors(replicated_buffer, tensors)
 
 
 @pytest.mark.distributed
