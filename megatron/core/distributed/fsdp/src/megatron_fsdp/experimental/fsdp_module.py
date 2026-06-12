@@ -140,6 +140,26 @@ def _materialize_and_collect_owned_parameters(
     def visit(submodule: nn.Module, submodule_fqn: str) -> None:
         direct_parameters = list(submodule.named_parameters(recurse=False))
 
+        if any(parameter.is_meta for _, parameter in direct_parameters):
+            if any(not parameter.is_meta for _, parameter in direct_parameters):
+                raise ValueError(
+                    f"Module {submodule_fqn!r} mixes meta and non-meta direct parameters. "
+                    "Initialize all direct parameters on meta or none of them."
+                )
+            submodule.to_empty(device=device, recurse=False)
+            with torch.no_grad():
+                if hasattr(submodule, "reset_parameters"):
+                    submodule.reset_parameters()
+                elif hasattr(submodule, "_reset_parameters"):
+                    submodule._reset_parameters()
+                else:
+                    raise ValueError(
+                        f"Module {submodule_fqn!r} does not have "
+                        "reset_parameters or _reset_parameters."
+                    )
+            # Module.to_empty may replace Parameters, so collect direct parameters again.
+            direct_parameters = list(submodule.named_parameters(recurse=False))
+
         for local_parameter_name, parameter in direct_parameters:
             parameter_fqn = (
                 f"{submodule_fqn}.{local_parameter_name}" if submodule_fqn else local_parameter_name
