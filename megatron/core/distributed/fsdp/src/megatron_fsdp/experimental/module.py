@@ -42,6 +42,8 @@ class FsdpContext:
     allgather_stream: torch.cuda.Stream
     delayed_releases: deque[DelayedRelease]
     root_module: "FsdpModule"
+    forward_order: list["FsdpModule"]
+    unsharded: set[int]
 
     def __init__(self, device: torch.device, root_module: "FsdpModule") -> None:
         """Create rank-local stream state for a root FSDP subtree.
@@ -52,8 +54,23 @@ class FsdpContext:
         """
         self.root_module = root_module
         self.delayed_releases = deque()
+        # Static forward execution order (built lazily from the module tree) and
+        # the set of module ids whose full parameters are currently materialized.
+        # These drive forward all-gather prefetch: while running F_i we issue the
+        # next unit's all-gather early.
+        self.forward_order = []
+        self.unsharded = set()
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
+
+    def next_of(self, module: "FsdpModule") -> "FsdpModule | None":
+        """Return the FSDP unit that runs right after ``module`` in forward, if any."""
+        for index, ordered in enumerate(self.forward_order):
+            if ordered is module:
+                if index + 1 < len(self.forward_order):
+                    return self.forward_order[index + 1]
+                return None
+        return None
 
     def enqueue_release(self, module: "FsdpModule") -> None:
         """Queue a module's unsharded storage for delayed release."""
@@ -185,13 +202,49 @@ class FsdpModule:
         return grad_hook
 
     def pre_forward(self) -> None:
-        """Prepare full parameters for forward compute."""
+        """Prepare full parameters for forward compute and prefetch the next unit.
+
+        Instead of relying on delayed releases to expose overlap, we issue the
+        NEXT FSDP unit's all-gather on the comm stream while this unit computes,
+        so ``AG_{i+1}`` is launched before ``F_i`` finishes rather than after it.
+        """
         self._lazy_init_context()
         self._ready_grad_parameters.clear()
+        context = self.context
+        allgather_stream = context.allgather_stream
+        current_stream = torch.cuda.current_stream(allgather_stream.device)
+
         if self.is_root():
-            allgather_stream = self.context.allgather_stream
-            allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
-        self._unshard_parameter_groups(sync_model_weight=True)
+            if not context.forward_order:
+                context.forward_order = [
+                    module
+                    for module in cast(nn.Module, self).modules()
+                    if isinstance(module, FsdpModule)
+                ]
+            context.unsharded.clear()
+            allgather_stream.wait_stream(current_stream)
+
+        # Gather this unit's parameters unless a prior unit already prefetched them.
+        if id(self) not in context.unsharded:
+            self._issue_unshard(sync_model_weight=True)
+        # Compute waits only for this unit's all-gather (the prefetch below is
+        # issued afterwards, so it is free to run concurrently with this unit).
+        current_stream.wait_stream(allgather_stream)
+
+        next_module = context.next_of(self)
+        if next_module is not None and id(next_module) not in context.unsharded:
+            next_module._issue_unshard(sync_model_weight=True)
+
+    def _issue_unshard(self, *, sync_model_weight: bool) -> None:
+        """Issue this unit's all-gather on the comm stream (no compute-side wait)."""
+        context = self.context
+        allgather_stream = context.allgather_stream
+        with torch.cuda.stream(allgather_stream):
+            for group in self._parameter_groups:
+                if sync_model_weight:
+                    group.sync_model_weight_from_main_weight()
+                group.unshard_parameters()
+        context.unsharded.add(id(self))
 
     def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
         """Materialize full parameters for this FSDP unit."""
@@ -213,6 +266,10 @@ class FsdpModule:
         """Return parameters to their sharded resting state after forward compute."""
         self._reshard_parameter_groups()
         self.context.enqueue_release(self)
+        # Free previously-consumed units incrementally so peak memory stays
+        # bounded to the current unit plus the one prefetched ahead. This keeps
+        # the just-prefetched next unit's storage alive.
+        self.context.drain_delayed_releases(target_length=1)
         if self.is_root():
             self.context.drain_delayed_releases(target_length=0)
 
@@ -239,6 +296,8 @@ class FsdpModule:
         """Release unsharded storage owned by this FSDP unit."""
         for group in self._parameter_groups:
             group.release_unsharded_storage()
+        if self._context is not None:
+            self._context.unsharded.discard(id(self))
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
