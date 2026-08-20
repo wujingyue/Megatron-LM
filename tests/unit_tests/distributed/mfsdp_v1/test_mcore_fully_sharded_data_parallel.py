@@ -751,6 +751,72 @@ def ref_cache():
 
 class TestMegatronFSDPE2E:
 
+    def test_ep_equals_dp_fused_wgrad_accumulates_linearly_before_clipping(self):
+        """Reproduce #6660 with a size-one expert-DP group before optimizer clipping.
+
+        EP=2 on two ranks makes each expert's DP group size one. Reusing one
+        microbatch makes the expected accumulated expert-gradient norm grow
+        linearly with the number of backwards passes.
+        """
+        Utils.initialize_model_parallel(expert_model_parallel_size=2)
+        try:
+            set_manual_seed(1234)
+            model_chunks, optimizer = make_moe_args_model_and_optimizer(
+                ut_filename=__file__,
+                micro_batch_size=1,
+                global_batch_size=2,
+                seq_length=16,
+                vocab_size=100,
+                padded_vocab_size=100,
+                train_iters=1,
+                use_megatron_fsdp=True,
+                ckpt_format="fsdp_dtensor",
+                data_parallel_sharding_strategy="optim_grads_params",
+                expert_model_parallel_size=2,
+                gradient_accumulation_fusion=True,
+            )
+            optimizer.zero_grad()
+
+            dp_group = mpu.get_data_parallel_group()
+            batch = next(
+                make_gpt_mock_data_iterator(
+                    dp_group=dp_group,
+                    vocab_size=100,
+                    sequence_length=16,
+                    batch_size=1,
+                    num_samples=1,
+                )
+            )
+
+            def repeated_batch():
+                while True:
+                    yield batch
+
+            data_iterator = repeated_batch()
+            expert_grad_norms = []
+            for _ in range(3):
+                pretrain_forward_backward(
+                    model=model_chunks,
+                    data_iterator=data_iterator,
+                    sequence_length=16,
+                    micro_batch_size=1,
+                    num_micro_batches=1,
+                )
+                model_chunks[0].finish_grad_sync()
+                expert_grads = [
+                    param.main_grad.detach().flatten()
+                    for name, param in model_chunks[0].named_parameters()
+                    if ".experts." in name and getattr(param, "main_grad", None) is not None
+                ]
+                assert expert_grads, "Expected fused expert main gradients."
+                expert_grad_norms.append(torch.linalg.vector_norm(torch.cat(expert_grads)))
+
+            torch.testing.assert_close(
+                expert_grad_norms[-1], 3 * expert_grad_norms[0], rtol=1e-4, atol=1e-6
+            )
+        finally:
+            Utils.destroy_model_parallel()
+
     @staticmethod
     def _training_loop(seed=42, **kwargs):
         """
