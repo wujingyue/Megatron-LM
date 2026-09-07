@@ -29,8 +29,8 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
-from .mxfp8_grouped_dbuffer import is_mxfp8_tensor
 from .module_utils import get_parameter_owner
+from .mxfp8_grouped_dbuffer import is_mxfp8_tensor
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import BlockAtomic, Flat
 from .schedule import SchedulePolicy

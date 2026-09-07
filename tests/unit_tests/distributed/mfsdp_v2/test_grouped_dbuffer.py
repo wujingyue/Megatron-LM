@@ -84,9 +84,10 @@ def test_grouped_dbuffer_redistributes_into_matching_destinations(distributed_se
             name: DBuffer(
                 mesh=mesh,
                 placements=[Flat()],
-                layout=plane.layout,
+                tensor_shapes=plane.layout.tensor_shapes,
                 dtype=plane.dtype,
                 device=plane.device,
+                block_size=plane.layout.block_size,
             )
             for name, plane in source.planes.items()
         }
