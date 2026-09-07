@@ -30,6 +30,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
 from .module_utils import get_parameter_owner
+from .mxfp8_grouped_dbuffer import MXFP8GroupedDBuffer, is_mxfp8_tensor
 from .placement import BlockAtomic
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -83,9 +84,9 @@ class FsdpParameterGroup:
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
-    model_weight: DBuffer
+    model_weight: DBuffer | None
     # Optimizer-layout view into model_weight storage, avoiding a second allocation.
-    post_optimizer_model_weight: DBuffer
+    post_optimizer_model_weight: DBuffer | None
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
@@ -97,7 +98,8 @@ class FsdpParameterGroup:
     # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
     # storage is stale and must be cleared before the next accumulation begins.
     _main_grad_is_stale: bool
-    _unsharded_model_weight: DBuffer
+    _unsharded_model_weight: DBuffer | None
+    mxfp8_model_weight: MXFP8GroupedDBuffer | None
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
 
@@ -112,6 +114,7 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        is_mxfp8: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -145,6 +148,7 @@ class FsdpParameterGroup:
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
+        self.mxfp8_model_weight = None
         for parameter, fqns in parameter_to_fqns.items():
             if parameter.dtype != self.dtype:
                 raise ValueError(
@@ -178,7 +182,15 @@ class FsdpParameterGroup:
         else:
             self._symm_mem_pool = None
 
-        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
+        if is_mxfp8:
+            self.mxfp8_model_weight = MXFP8GroupedDBuffer(
+                list(parameter_to_fqns), self.mesh, model_weight_placements
+            )
+            self.model_weight = None
+            self.post_optimizer_model_weight = None
+            self._model_weight_is_stale = False
+            self._unsharded_model_weight = None
+        elif main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
         else:
             # Keep the configured compute-weight layout alive for the lifetime of this
@@ -194,22 +206,24 @@ class FsdpParameterGroup:
                     device=self.main_weight.device,
                     block_size=block_size,
                 )
-        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
-        # Cast into the preallocated optimizer-layout view on the current stream.
-        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
-        self._model_weight_is_stale = (
-            self.post_optimizer_model_weight.placements != self.model_weight.placements
-        )
-
-        with self._symmetric_memory_context():
-            self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
-                dtype=self.dtype,
-                device=self.main_weight.device,
-                block_size=block_size,
+        if not is_mxfp8:
+            assert self.model_weight is not None
+            self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
+            # Cast into the preallocated optimizer-layout view on the current stream.
+            self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+            self._model_weight_is_stale = (
+                self.post_optimizer_model_weight.placements != self.model_weight.placements
             )
+
+            with self._symmetric_memory_context():
+                self._unsharded_model_weight = DBuffer(
+                    mesh=self.mesh,
+                    placements=[Replicate()] * self.mesh.ndim,
+                    tensor_shapes=tensor_shapes,
+                    dtype=self.dtype,
+                    device=self.main_weight.device,
+                    block_size=block_size,
+                )
 
         self.main_grad = None
         self.pre_optimizer_main_grad = None
@@ -237,7 +251,13 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
+            if self.mxfp8_model_weight is not None:
+                if not is_mxfp8_tensor(parameter):
+                    raise TypeError("MXFP8 parameter group contains a non-MXFP8 parameter.")
+                unsharded_tensor = parameter
+            else:
+                assert self._unsharded_model_weight is not None
+                unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
@@ -247,7 +267,7 @@ class FsdpParameterGroup:
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
                 torch.utils.swap_tensors(parameter, materialized_parameter)
-            else:
+            elif self.mxfp8_model_weight is None:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
             # Parameter-owned markers must not retain their FSDP module tree.
@@ -264,7 +284,11 @@ class FsdpParameterGroup:
             )
         self.fsdp_parameters = tuple(fsdp_parameters)
 
-        self._unsharded_model_weight.release_storage()
+        if self.mxfp8_model_weight is not None:
+            self.mxfp8_model_weight.release_unsharded_storage()
+        else:
+            assert self._unsharded_model_weight is not None
+            self._unsharded_model_weight.release_storage()
         self._switch_to_sharded_parameters()
 
     def _symmetric_memory_context(self):
@@ -290,6 +314,11 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
+        if self.mxfp8_model_weight is not None:
+            self.mxfp8_model_weight.sync_from_main(self.main_weight)
+            return
+        assert self.model_weight is not None
+        assert self.post_optimizer_model_weight is not None
         self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
@@ -297,6 +326,13 @@ class FsdpParameterGroup:
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
+        if self.mxfp8_model_weight is not None:
+            self.mxfp8_model_weight.unshard_into_tensor()
+            self._switch_to_unsharded_parameters()
+            return
+        assert self.model_weight is not None
+        assert self.post_optimizer_model_weight is not None
+        assert self._unsharded_model_weight is not None
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
@@ -337,7 +373,11 @@ class FsdpParameterGroup:
         # That alternative is not much cleaner, and splitting post-forward and
         # post-backward reshard behavior would make the caller code less clean,
         # so keep the shared storage-release path.
-        self._unsharded_model_weight.release_storage()
+        if self.mxfp8_model_weight is not None:
+            self.mxfp8_model_weight.release_unsharded_storage()
+        else:
+            assert self._unsharded_model_weight is not None
+            self._unsharded_model_weight.release_storage()
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
