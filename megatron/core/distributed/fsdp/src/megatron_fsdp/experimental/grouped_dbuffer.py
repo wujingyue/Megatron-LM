@@ -12,40 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Coordinated multi-plane distributed buffers.
+"""Transformer Engine MXFP8 distributed buffers with coordinated physical planes.
 
-``GroupedDBuffer`` composes ordinary :class:`DBuffer` instances.  It is the
-storage primitive for formats whose logical tensors have more than one physical
-plane, such as MXFP8's data and scale tensors.  It deliberately does not depend
-on Transformer Engine: a format adapter owns its metadata and uses named planes
-to construct the corresponding tensor wrappers.
+``GroupedDBuffer`` owns an MXFP8 tensor's data and scale planes, their MFSDP
+layouts, and the tensor-wrapper lifecycle required by Transformer Engine.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Self
 
+import torch
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Replicate
 from torch.distributed.tensor.placement_types import Placement
 
+from ..mixed_precision import HAVE_TE_MXFP8TENSOR
 from .dbuffer import DBuffer
+
+if HAVE_TE_MXFP8TENSOR:
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+else:
+    MXFP8Tensor = None
+
+_MXFP8_BLOCK_SIZE = 32
+
+
+def is_mxfp8_tensor(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` is a TE MXFP8 tensor with both physical data planes."""
+    return (
+        HAVE_TE_MXFP8TENSOR
+        and isinstance(tensor, MXFP8Tensor)
+        and tensor._rowwise_data is not None
+        and tensor._columnwise_data is not None
+    )
 
 
 class GroupedDBuffer:
-    """A set of physical DBuffers that move together.
+    """The MFSDP storage and lifecycle for one TE MXFP8 tensor.
 
-    Planes may have different dtypes, logical shapes, and layouts, but must
-    live on the same mesh with the same placement state.  Format adapters are
-    responsible for choosing coupled layouts such that corresponding data and
-    metadata tiles have the same owner.
-
-    The class intentionally exposes no ``get_dtensor`` equivalent: multi-plane
-    storage is not one DTensor.  Adapters should retrieve a named plane and
-    construct a format-specific view from it.
+    The data and scale planes can have different dtypes, logical shapes, and
+    layouts, but share mesh and placement state.  The direct-plane constructor
+    is retained for constructing the replicated staging storage internally.
     """
 
     mesh: DeviceMesh
     placements: tuple[Placement, ...]
     planes: dict[str, DBuffer]
+    tensor: torch.Tensor | None
+    unsharded: Self | None
+    _local_tensor: torch.Tensor | None
 
     def __init__(self, planes: Mapping[str, DBuffer]) -> None:
         if not planes:
@@ -54,6 +69,9 @@ class GroupedDBuffer:
             raise ValueError("GroupedDBuffer plane names must be non-empty.")
 
         self.planes = dict(planes)
+        self.tensor = None
+        self.unsharded = None
+        self._local_tensor = None
         first_plane = next(iter(self.planes.values()))
         self.mesh = first_plane.mesh
         self.placements = first_plane.placements
@@ -67,6 +85,118 @@ class GroupedDBuffer:
                     f"Plane {name!r} uses placements {plane.placements!r}, "
                     f"expected {self.placements!r}."
                 )
+
+    @classmethod
+    def from_mxfp8(
+        cls, tensors: Sequence[torch.Tensor], mesh: DeviceMesh, placements: Sequence[Placement]
+    ) -> Self:
+        """Create MXFP8 grouped storage and retain its TE wrapper metadata."""
+        if len(tensors) != 1:
+            raise NotImplementedError("Experimental MXFP8 MFSDP supports one parameter per group.")
+        tensor = tensors[0]
+        if not is_mxfp8_tensor(tensor) or tensor.ndim != 2:
+            raise TypeError("GroupedDBuffer.from_mxfp8() requires a 2D materialized MXFP8Tensor.")
+        if tensor.shape[0] % _MXFP8_BLOCK_SIZE or mesh.size() != 2:
+            raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
+        local_rows = tensor.shape[0] // mesh.size()
+        if local_rows % _MXFP8_BLOCK_SIZE:
+            raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
+        result = cls(
+            {
+                "rowwise_data": DBuffer.distribute_tensors(
+                    [tensor._rowwise_data], mesh, placements, block_size=_MXFP8_BLOCK_SIZE
+                ),
+                "columnwise_data": DBuffer.distribute_tensors(
+                    [tensor._columnwise_data], mesh, placements, block_size=_MXFP8_BLOCK_SIZE
+                ),
+                "rowwise_scale": DBuffer.distribute_tensors(
+                    [cls._compact_rowwise_scale(tensor)],
+                    mesh,
+                    placements,
+                    block_size=_MXFP8_BLOCK_SIZE,
+                ),
+                "columnwise_scale": DBuffer.distribute_tensors(
+                    [cls._compact_columnwise_scale(tensor)], mesh, placements
+                ),
+            }
+        )
+        result.tensor = tensor
+        result.unsharded = cls(
+            {
+                name: DBuffer(
+                    mesh=mesh,
+                    placements=[Replicate()] * mesh.ndim,
+                    tensor_shapes=plane.layout.tensor_shapes,
+                    dtype=plane.dtype,
+                    device=plane.device,
+                    block_size=plane.layout.block_size,
+                )
+                for name, plane in result.planes.items()
+            }
+        )
+        result._local_tensor = tensor.split(local_rows, dim=0)[mesh.get_local_rank()]
+        result._bind_local_tensor()
+        return result
+
+    @staticmethod
+    def _compact_rowwise_scale(tensor: torch.Tensor) -> torch.Tensor:
+        """Remove TE padding from a rowwise scale tensor."""
+        return tensor._rowwise_scale_inv[: tensor.shape[0], : tensor.shape[1] // 32].contiguous()
+
+    @staticmethod
+    def _compact_columnwise_scale(tensor: torch.Tensor) -> torch.Tensor:
+        """Remove TE padding from a columnwise scale tensor."""
+        return tensor._columnwise_scale_inv[: tensor.shape[0] // 32, : tensor.shape[1]].contiguous()
+
+    @staticmethod
+    def _unpack_scale(destination: torch.Tensor, source: torch.Tensor) -> None:
+        destination.zero_()
+        destination[: source.shape[0], : source.shape[1]].copy_(source)
+
+    def _bind_local_tensor(self) -> None:
+        assert self._local_tensor is not None
+        self._local_tensor._rowwise_data = self.plane("rowwise_data").get_local_tensor(0)
+        self._local_tensor._columnwise_data = self.plane("columnwise_data").get_local_tensor(0)
+        self._unpack_scale(
+            self._local_tensor._rowwise_scale_inv, self.plane("rowwise_scale").get_local_tensor(0)
+        )
+        self._unpack_scale(
+            self._local_tensor._columnwise_scale_inv,
+            self.plane("columnwise_scale").get_local_tensor(0),
+        )
+
+    def sync_from_main(self, main_weight: DBuffer) -> None:
+        """Quantize the local FP32 master shard into MXFP8 grouped planes."""
+        assert self._local_tensor is not None
+        with torch.no_grad():
+            self._local_tensor.quantize_(main_weight.get_local_tensor(0))
+        self.plane("rowwise_scale").get_local_tensor(0).copy_(
+            self._compact_rowwise_scale(self._local_tensor)
+        )
+        self.plane("columnwise_scale").get_local_tensor(0).copy_(
+            self._compact_columnwise_scale(self._local_tensor)
+        )
+
+    def unshard_into_tensor(self) -> None:
+        """All-gather MXFP8 planes and bind them to the retained TE wrapper."""
+        assert self.tensor is not None and self.unsharded is not None
+        self.unsharded.reallocate_storage()
+        self.redistribute([Replicate()] * self.mesh.ndim, out=self.unsharded)
+        self.tensor._rowwise_data = self.unsharded.plane("rowwise_data").get_local_tensor(0)
+        self.tensor._columnwise_data = self.unsharded.plane("columnwise_data").get_local_tensor(0)
+        self._unpack_scale(
+            self.tensor._rowwise_scale_inv,
+            self.unsharded.plane("rowwise_scale").get_local_tensor(0),
+        )
+        self._unpack_scale(
+            self.tensor._columnwise_scale_inv,
+            self.unsharded.plane("columnwise_scale").get_local_tensor(0),
+        )
+
+    def release_unsharded_storage(self) -> None:
+        """Release the all-gathered MXFP8 plane storage."""
+        assert self.unsharded is not None
+        self.unsharded.release_storage()
 
     @property
     def plane_names(self) -> tuple[str, ...]:

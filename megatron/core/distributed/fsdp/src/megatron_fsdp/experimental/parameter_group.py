@@ -29,8 +29,8 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
+from .grouped_dbuffer import GroupedDBuffer, is_mxfp8_tensor
 from .module_utils import get_parameter_owner
-from .mxfp8_grouped_dbuffer import MXFP8GroupedDBuffer, is_mxfp8_tensor
 from .placement import BlockAtomic
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -99,7 +99,7 @@ class FsdpParameterGroup:
     # storage is stale and must be cleared before the next accumulation begins.
     _main_grad_is_stale: bool
     _unsharded_model_weight: DBuffer | None
-    mxfp8_model_weight: MXFP8GroupedDBuffer | None
+    mxfp8_model_weight: GroupedDBuffer | None
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
 
@@ -183,7 +183,7 @@ class FsdpParameterGroup:
             self._symm_mem_pool = None
 
         if is_mxfp8:
-            self.mxfp8_model_weight = MXFP8GroupedDBuffer(
+            self.mxfp8_model_weight = GroupedDBuffer.from_mxfp8(
                 list(parameter_to_fqns), self.mesh, model_weight_placements
             )
             self.model_weight = None

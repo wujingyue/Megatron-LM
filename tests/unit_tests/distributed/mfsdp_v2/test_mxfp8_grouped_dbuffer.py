@@ -7,23 +7,19 @@ import torch
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 
-te = pytest.importorskip("transformer_engine")
-
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (  # noqa: E402
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.mxfp8_grouped_dbuffer import (  # noqa: E402
-    MXFP8GroupedDBuffer,
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.grouped_dbuffer import (
+    GroupedDBuffer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (  # noqa: E402
-    BlockAtomic,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import (  # noqa: E402
-    MixedPrecisionPolicy,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import BlockAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
+
+te = pytest.importorskip("transformer_engine")
 
 
 def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
@@ -52,7 +48,7 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
         )
 
     parameter_group = linear.parameter_groups[0]
-    assert isinstance(parameter_group.mxfp8_model_weight, MXFP8GroupedDBuffer)
+    assert isinstance(parameter_group.mxfp8_model_weight, GroupedDBuffer)
     assert parameter_group.main_weight.placements == (BlockAtomic(32),)
 
     optimizer = torch.optim.SGD(linear.parameters(), lr=0.1)
@@ -68,8 +64,7 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
 
     assert torch.isfinite(loss)
     assert not torch.equal(main_weight_before, parameter_group.main_weight.local_buffer)
-    grouped = parameter_group.mxfp8_model_weight.grouped
-    assert grouped.plane_names == (
+    assert parameter_group.mxfp8_model_weight.plane_names == (
         "rowwise_data",
         "columnwise_data",
         "rowwise_scale",
