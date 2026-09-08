@@ -59,8 +59,6 @@ class GroupedDBuffer:
     placements: tuple[Placement, ...]
     planes: dict[str, DBuffer]
     tensor: torch.Tensor | None
-    unsharded: Self | None
-    _local_tensor: torch.Tensor | None
 
     def __init__(self, planes: Mapping[str, DBuffer]) -> None:
         if not planes:
@@ -70,8 +68,6 @@ class GroupedDBuffer:
 
         self.planes = dict(planes)
         self.tensor = None
-        self.unsharded = None
-        self._local_tensor = None
         first_plane = next(iter(self.planes.values()))
         self.mesh = first_plane.mesh
         self.placements = first_plane.placements
@@ -90,17 +86,12 @@ class GroupedDBuffer:
     def from_mxfp8(
         cls, tensors: Sequence[torch.Tensor], mesh: DeviceMesh, placements: Sequence[Placement]
     ) -> Self:
-        """Create MXFP8 grouped storage and retain its TE wrapper metadata."""
+        """Create MXFP8 grouped storage for the requested placement state."""
         if len(tensors) != 1:
             raise NotImplementedError("Experimental MXFP8 MFSDP supports one parameter per group.")
         tensor = tensors[0]
         if not is_mxfp8_tensor(tensor) or tensor.ndim != 2:
             raise TypeError("GroupedDBuffer.from_mxfp8() requires a 2D materialized MXFP8Tensor.")
-        if tensor.shape[0] % _MXFP8_BLOCK_SIZE or mesh.size() != 2:
-            raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
-        local_rows = tensor.shape[0] // mesh.size()
-        if local_rows % _MXFP8_BLOCK_SIZE:
-            raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
         result = cls(
             {
                 "rowwise_data": DBuffer.distribute_tensors(
@@ -120,22 +111,16 @@ class GroupedDBuffer:
                 ),
             }
         )
-        result.tensor = tensor
-        result.unsharded = cls(
-            {
-                name: DBuffer(
-                    mesh=mesh,
-                    placements=[Replicate()] * mesh.ndim,
-                    tensor_shapes=plane.layout.tensor_shapes,
-                    dtype=plane.dtype,
-                    device=plane.device,
-                    block_size=plane.layout.block_size,
-                )
-                for name, plane in result.planes.items()
-            }
-        )
-        result._local_tensor = tensor.split(local_rows, dim=0)[mesh.get_local_rank()]
-        result._bind_local_tensor()
+        if all(isinstance(placement, Replicate) for placement in placements):
+            result.tensor = tensor
+        else:
+            if tensor.shape[0] % _MXFP8_BLOCK_SIZE or mesh.size() != 2:
+                raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
+            local_rows = tensor.shape[0] // mesh.size()
+            if local_rows % _MXFP8_BLOCK_SIZE:
+                raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
+            result.tensor = tensor.split(local_rows, dim=0)[mesh.get_local_rank()]
+        result.bind_tensor()
         return result
 
     @staticmethod
@@ -153,50 +138,29 @@ class GroupedDBuffer:
         destination.zero_()
         destination[: source.shape[0], : source.shape[1]].copy_(source)
 
-    def _bind_local_tensor(self) -> None:
-        assert self._local_tensor is not None
-        self._local_tensor._rowwise_data = self.plane("rowwise_data").get_local_tensor(0)
-        self._local_tensor._columnwise_data = self.plane("columnwise_data").get_local_tensor(0)
+    def bind_tensor(self) -> None:
+        """Bind this buffer's physical planes to its matching TE wrapper."""
+        assert self.tensor is not None
+        self.tensor._rowwise_data = self.plane("rowwise_data").get_local_tensor(0)
+        self.tensor._columnwise_data = self.plane("columnwise_data").get_local_tensor(0)
         self._unpack_scale(
-            self._local_tensor._rowwise_scale_inv, self.plane("rowwise_scale").get_local_tensor(0)
+            self.tensor._rowwise_scale_inv, self.plane("rowwise_scale").get_local_tensor(0)
         )
         self._unpack_scale(
-            self._local_tensor._columnwise_scale_inv,
-            self.plane("columnwise_scale").get_local_tensor(0),
+            self.tensor._columnwise_scale_inv, self.plane("columnwise_scale").get_local_tensor(0)
         )
 
     def sync_from_main(self, main_weight: DBuffer) -> None:
         """Quantize the local FP32 master shard into MXFP8 grouped planes."""
-        assert self._local_tensor is not None
+        assert self.tensor is not None
         with torch.no_grad():
-            self._local_tensor.quantize_(main_weight.get_local_tensor(0))
+            self.tensor.quantize_(main_weight.get_local_tensor(0))
         self.plane("rowwise_scale").get_local_tensor(0).copy_(
-            self._compact_rowwise_scale(self._local_tensor)
+            self._compact_rowwise_scale(self.tensor)
         )
         self.plane("columnwise_scale").get_local_tensor(0).copy_(
-            self._compact_columnwise_scale(self._local_tensor)
+            self._compact_columnwise_scale(self.tensor)
         )
-
-    def unshard_into_tensor(self) -> None:
-        """All-gather MXFP8 planes and bind them to the retained TE wrapper."""
-        assert self.tensor is not None and self.unsharded is not None
-        self.unsharded.reallocate_storage()
-        self.redistribute([Replicate()] * self.mesh.ndim, out=self.unsharded)
-        self.tensor._rowwise_data = self.unsharded.plane("rowwise_data").get_local_tensor(0)
-        self.tensor._columnwise_data = self.unsharded.plane("columnwise_data").get_local_tensor(0)
-        self._unpack_scale(
-            self.tensor._rowwise_scale_inv,
-            self.unsharded.plane("rowwise_scale").get_local_tensor(0),
-        )
-        self._unpack_scale(
-            self.tensor._columnwise_scale_inv,
-            self.unsharded.plane("columnwise_scale").get_local_tensor(0),
-        )
-
-    def release_unsharded_storage(self) -> None:
-        """Release the all-gathered MXFP8 plane storage."""
-        assert self.unsharded is not None
-        self.unsharded.release_storage()
 
     @property
     def plane_names(self) -> tuple[str, ...]:

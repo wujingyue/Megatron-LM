@@ -48,8 +48,11 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
         )
 
     parameter_group = linear.parameter_groups[0]
-    assert isinstance(parameter_group.mxfp8_model_weight, GroupedDBuffer)
+    assert isinstance(parameter_group.model_weight, GroupedDBuffer)
     assert parameter_group.main_weight.placements == (BlockAtomic(32),)
+    assert parameter_group.model_weight.tensor.shape == (32, 64)
+    assert isinstance(parameter_group._unsharded_model_weight, GroupedDBuffer)
+    assert parameter_group._unsharded_model_weight.tensor.shape == (64, 64)
 
     optimizer = torch.optim.SGD(linear.parameters(), lr=0.1)
     fully_shard_optimizer(optimizer)
@@ -64,7 +67,7 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
 
     assert torch.isfinite(loss)
     assert not torch.equal(main_weight_before, parameter_group.main_weight.local_buffer)
-    assert parameter_group.mxfp8_model_weight.plane_names == (
+    assert parameter_group.model_weight.plane_names == (
         "rowwise_data",
         "columnwise_data",
         "rowwise_scale",
