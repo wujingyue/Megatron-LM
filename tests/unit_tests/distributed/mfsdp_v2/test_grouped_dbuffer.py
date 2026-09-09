@@ -81,9 +81,18 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
     recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=te.common.recipe.Format.HYBRID)
     with te.pytorch.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
         linear = te.pytorch.Linear(
-            64, 64, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
+            64, 256, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
         )
-
+        reference = te.pytorch.Linear(
+            64, 256, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
+        )
+    reference_main_weight = torch.nn.Parameter(
+        linear.weight.get_high_precision_init_val().to(
+            device=distributed_setup.device, dtype=torch.float32
+        )
+    )
+    with torch.no_grad():
+        reference.weight.quantize_(reference_main_weight)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     placements = Placements(
         dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
@@ -100,23 +109,41 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
     assert isinstance(parameter_group.model_weight, GroupedDBuffer)
     assert parameter_group.post_optimizer_model_weight is parameter_group.model_weight
     assert parameter_group.main_weight.placements == (BlockAtomic(32),)
-    assert parameter_group.model_weight.get_local_tensor(0).shape == (32, 64)
+    assert parameter_group.model_weight.get_local_tensor(0).shape == (128, 64)
     assert isinstance(parameter_group._unsharded_model_weight, GroupedDBuffer)
-    assert parameter_group._unsharded_model_weight.get_local_tensor(0).shape == (64, 64)
 
     optimizer = torch.optim.SGD(linear.parameters(), lr=0.1)
     fully_shard_optimizer(optimizer)
-    main_weight_before = parameter_group.main_weight.local_buffer.detach().clone()
+    reference_optimizer = torch.optim.SGD([reference_main_weight], lr=0.1)
 
+    torch.manual_seed(1234)
     x = torch.randn(32, 64, dtype=torch.bfloat16, device=distributed_setup.device)
     optimizer.zero_grad(set_to_none=True)
+    reference_optimizer.zero_grad(set_to_none=True)
     with te.pytorch.autocast(recipe=recipe):
         loss = linear(x).float().square().mean()
+        reference_loss = reference(x).float().square().mean()
+        torch.testing.assert_close(loss, reference_loss, rtol=5e-2, atol=5e-2)
     loss.backward()
+    reference_loss.backward()
+    torch.testing.assert_close(
+        parameter_group.main_grad.get_local_tensor(0),
+        reference.weight.grad[distributed_setup.rank * 128 : (distributed_setup.rank + 1) * 128],
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    reference_main_weight.grad = reference.weight.grad.float()
+    reference.weight.grad = None
     optimizer.step()
+    reference_optimizer.step()
+    with torch.no_grad():
+        reference.weight.quantize_(reference_main_weight)
 
     assert torch.isfinite(loss)
-    assert not torch.equal(main_weight_before, parameter_group.main_weight.local_buffer)
+    with torch.no_grad(), te.pytorch.autocast(recipe=recipe):
+        output = linear(x)
+        reference_output = reference(x)
+    torch.testing.assert_close(output, reference_output, rtol=5e-2, atol=5e-2)
     assert parameter_group.model_weight.plane_names == (
         "rowwise_data",
         "columnwise_data",

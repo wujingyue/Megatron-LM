@@ -32,6 +32,13 @@ import transformer_engine_torch as tex
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 
 _MXFP8_BLOCK_SIZE = 32
+_MXFP8_ROWWISE_SCALE_ALIGNMENT = 128
+_MXFP8_COLUMNWISE_SCALE_ALIGNMENT = 128
+_MXFP8_SCALE_ROW_ALIGNMENT = 4
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
 
 
 def is_mxfp8_tensor(tensor: torch.Tensor) -> bool:
@@ -81,7 +88,14 @@ class GroupedDBuffer:
                     mesh,
                     placements,
                     (
-                        torch.Size((shape[0], shape[1] // _MXFP8_BLOCK_SIZE))
+                        torch.Size(
+                            (
+                                _round_up(shape[0], _MXFP8_ROWWISE_SCALE_ALIGNMENT),
+                                _round_up(
+                                    shape[1] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT
+                                ),
+                            )
+                        )
                         for shape in tensor_shapes
                     ),
                     torch.uint8,
@@ -92,7 +106,14 @@ class GroupedDBuffer:
                     mesh,
                     self._plane_placements("columnwise_scale", placements),
                     (
-                        torch.Size((shape[0] // _MXFP8_BLOCK_SIZE, shape[1]))
+                        torch.Size(
+                            (
+                                _round_up(
+                                    shape[0] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT
+                                ),
+                                _round_up(shape[1], _MXFP8_COLUMNWISE_SCALE_ALIGNMENT),
+                            )
+                        )
                         for shape in tensor_shapes
                     ),
                     torch.uint8,
@@ -125,45 +146,17 @@ class GroupedDBuffer:
             Flat() if isinstance(placement, BlockAtomic) else placement for placement in placements
         )
 
-    @staticmethod
-    def _compact_rowwise_scale(tensor: MXFP8Tensor) -> torch.Tensor:
-        """Remove TE padding from a rowwise scale tensor."""
-        return tensor._rowwise_scale_inv[
-            : tensor.shape[0], : tensor.shape[1] // _MXFP8_BLOCK_SIZE
-        ].contiguous()
-
-    @staticmethod
-    def _compact_columnwise_scale(tensor: MXFP8Tensor) -> torch.Tensor:
-        """Remove TE padding from a columnwise scale tensor."""
-        return tensor._columnwise_scale_inv[
-            : tensor.shape[0] // _MXFP8_BLOCK_SIZE, : tensor.shape[1]
-        ].contiguous()
-
-    @staticmethod
-    def _unpack_scale(destination: torch.Tensor, source: torch.Tensor) -> None:
-        destination.zero_()
-        destination[: source.shape[0], : source.shape[1]].copy_(source)
-
     def get_local_tensor(self, index: int) -> torch.Tensor:
         """Construct a TE MXFP8 wrapper from this rank's four physical-plane views."""
         rowwise_data = self.plane("rowwise_data").get_local_tensor(index)
         fp8_dtype = tex.DType.kFloat8E4M3
-        prototype = MXFP8Quantizer(fp8_dtype)(
-            torch.zeros(rowwise_data.shape, dtype=torch.bfloat16, device=rowwise_data.device)
-        )
-        self._unpack_scale(
-            prototype._rowwise_scale_inv, self.plane("rowwise_scale").get_local_tensor(index)
-        )
-        self._unpack_scale(
-            prototype._columnwise_scale_inv, self.plane("columnwise_scale").get_local_tensor(index)
-        )
         return MXFP8Tensor(
             shape=rowwise_data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
-            rowwise_scale_inv=prototype._rowwise_scale_inv,
+            rowwise_scale_inv=self.plane("rowwise_scale").get_local_tensor(index),
             columnwise_data=self.plane("columnwise_data").get_local_tensor(index),
-            columnwise_scale_inv=prototype._columnwise_scale_inv,
+            columnwise_scale_inv=self.plane("columnwise_scale").get_local_tensor(index),
             fp8_dtype=fp8_dtype,
             quantizer=MXFP8Quantizer(fp8_dtype),
             with_gemm_swizzled_scales=False,
@@ -177,12 +170,6 @@ class GroupedDBuffer:
             tensor = self.get_local_tensor(index)
             with torch.no_grad():
                 tensor.quantize_(main_weight.get_local_tensor(index))
-            self.plane("rowwise_scale").get_local_tensor(index).copy_(
-                self._compact_rowwise_scale(tensor)
-            )
-            self.plane("columnwise_scale").get_local_tensor(index).copy_(
-                self._compact_columnwise_scale(tensor)
-            )
 
     @property
     def plane_names(self) -> tuple[str, ...]:

@@ -166,12 +166,63 @@ class FsdpParameterGroup:
                 if isinstance(placement, BlockAtomic):
                     block_size = math.lcm(block_size, placement.block_size)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
-        self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
-            mesh=self.mesh,
-            placements=main_weight_placements,
-            block_size=block_size,
-        )
+
+        high_precision_init_values: tuple[torch.Tensor | None, ...] = ()
+        has_high_precision_init_values = False
+        if is_mxfp8:
+            high_precision_init_values = tuple(
+                (
+                    get_high_precision_init_val()
+                    if (
+                        get_high_precision_init_val := getattr(
+                            parameter, "get_high_precision_init_val", None
+                        )
+                    )
+                    else None
+                )
+                for parameter in parameter_to_fqns
+            )
+            if any(value is not None for value in high_precision_init_values) and not all(
+                value is not None for value in high_precision_init_values
+            ):
+                raise ValueError(
+                    "MXFP8 parameter group has a mixture of preserved and missing high-precision "
+                    "initialization values."
+                )
+            has_high_precision_init_values = all(
+                value is not None for value in high_precision_init_values
+            )
+
+        if has_high_precision_init_values:
+            self.main_weight = DBuffer.distribute_tensors(
+                (
+                    value.to(device=first_parameter.device, dtype=main_weight_dtype)
+                    for value in high_precision_init_values
+                    if value is not None
+                ),
+                mesh=self.mesh,
+                placements=main_weight_placements,
+                block_size=block_size,
+            )
+            for parameter in parameter_to_fqns:
+                parameter.clear_high_precision_init_val()
+        elif is_mxfp8:
+            # Checkpoint restore will populate main_weight and then regenerate the MXFP8 planes.
+            self.main_weight = DBuffer(
+                mesh=self.mesh,
+                placements=main_weight_placements,
+                tensor_shapes=tensor_shapes,
+                dtype=main_weight_dtype,
+                device=first_parameter.device,
+                block_size=block_size,
+            )
+        else:
+            self.main_weight = DBuffer.distribute_tensors(
+                (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
+                mesh=self.mesh,
+                placements=main_weight_placements,
+                block_size=block_size,
+            )
 
         if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
@@ -188,7 +239,8 @@ class FsdpParameterGroup:
                 self.main_weight.device,
                 block_size=block_size,
             )
-            self.model_weight.sync_from_main(self.main_weight)
+            if has_high_precision_init_values:
+                self.model_weight.sync_from_main(self.main_weight)
             self._unsharded_model_weight = GroupedDBuffer(
                 self.mesh,
                 [Replicate()] * self.mesh.ndim,
@@ -267,7 +319,7 @@ class FsdpParameterGroup:
             else:
                 assert self._unsharded_model_weight is not None
                 unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
-            if parameter.is_meta or isinstance(self.model_weight, GroupedDBuffer):
+            if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
                 # This may be problematic if attributes from the original Parameter need
@@ -276,7 +328,7 @@ class FsdpParameterGroup:
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
                 torch.utils.swap_tensors(parameter, materialized_parameter)
-            elif not isinstance(self.model_weight, GroupedDBuffer):
+            else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
             # Parameter-owned markers must not retain their FSDP module tree.
@@ -333,15 +385,13 @@ class FsdpParameterGroup:
         if isinstance(self.model_weight, GroupedDBuffer):
             assert isinstance(self._unsharded_model_weight, GroupedDBuffer)
             self._unsharded_model_weight.reallocate_storage()
-            self.model_weight.redistribute(
-                [Replicate()] * self.mesh.ndim, out=self._unsharded_model_weight
+            preserved_tensors = tuple(
+                plane.local_buffer for plane in self._unsharded_model_weight.planes.values()
             )
-            for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-                materialized_parameter = nn.Parameter(
-                    self._unsharded_model_weight.get_local_tensor(index),
-                    requires_grad=fsdp_parameter.unsharded.requires_grad,
+            with torch.autograd._unsafe_preserve_version_counter(preserved_tensors):
+                self.model_weight.redistribute(
+                    [Replicate()] * self.mesh.ndim, out=self._unsharded_model_weight
                 )
-                torch.utils.swap_tensors(fsdp_parameter.unsharded, materialized_parameter)
             self._switch_to_unsharded_parameters()
             return
         assert isinstance(self.model_weight, DBuffer)
