@@ -80,7 +80,10 @@ class GroupedDBuffer:
                 "rowwise_scale": DBuffer(
                     mesh,
                     placements,
-                    (torch.Size((shape[0], shape[1] // 32)) for shape in tensor_shapes),
+                    (
+                        torch.Size((shape[0], shape[1] // _MXFP8_BLOCK_SIZE))
+                        for shape in tensor_shapes
+                    ),
                     torch.uint8,
                     device,
                     block_size=block_size,
@@ -88,7 +91,10 @@ class GroupedDBuffer:
                 "columnwise_scale": DBuffer(
                     mesh,
                     self._plane_placements("columnwise_scale", placements),
-                    (torch.Size((shape[0] // 32, shape[1])) for shape in tensor_shapes),
+                    (
+                        torch.Size((shape[0] // _MXFP8_BLOCK_SIZE, shape[1]))
+                        for shape in tensor_shapes
+                    ),
                     torch.uint8,
                     device,
                 ),
@@ -122,12 +128,16 @@ class GroupedDBuffer:
     @staticmethod
     def _compact_rowwise_scale(tensor: MXFP8Tensor) -> torch.Tensor:
         """Remove TE padding from a rowwise scale tensor."""
-        return tensor._rowwise_scale_inv[: tensor.shape[0], : tensor.shape[1] // 32].contiguous()
+        return tensor._rowwise_scale_inv[
+            : tensor.shape[0], : tensor.shape[1] // _MXFP8_BLOCK_SIZE
+        ].contiguous()
 
     @staticmethod
     def _compact_columnwise_scale(tensor: MXFP8Tensor) -> torch.Tensor:
         """Remove TE padding from a columnwise scale tensor."""
-        return tensor._columnwise_scale_inv[: tensor.shape[0] // 32, : tensor.shape[1]].contiguous()
+        return tensor._columnwise_scale_inv[
+            : tensor.shape[0] // _MXFP8_BLOCK_SIZE, : tensor.shape[1]
+        ].contiguous()
 
     @staticmethod
     def _unpack_scale(destination: torch.Tensor, source: torch.Tensor) -> None:
