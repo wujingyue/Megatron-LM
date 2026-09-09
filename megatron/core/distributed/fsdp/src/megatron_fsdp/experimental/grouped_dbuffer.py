@@ -12,26 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Transformer Engine MXFP8 distributed buffers with coordinated physical planes.
+"""Transformer Engine MXFP8 distributed buffers composed from physical planes."""
 
-``GroupedDBuffer`` owns an MXFP8 tensor's data and scale planes, their MFSDP
-layouts, and the tensor-wrapper lifecycle required by Transformer Engine.
-"""
-
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable
 from typing import Self
 
 import torch
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Replicate
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import HAVE_TE_MXFP8TENSOR
 from .dbuffer import DBuffer
 
 if HAVE_TE_MXFP8TENSOR:
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 else:
+    tex = None
+    MXFP8Quantizer = None
     MXFP8Tensor = None
 
 _MXFP8_BLOCK_SIZE = 32
@@ -58,70 +56,59 @@ class GroupedDBuffer:
     mesh: DeviceMesh
     placements: tuple[Placement, ...]
     planes: dict[str, DBuffer]
-    tensor: torch.Tensor | None
 
-    def __init__(self, planes: Mapping[str, DBuffer]) -> None:
-        if not planes:
-            raise ValueError("GroupedDBuffer requires at least one physical plane.")
-        if any(not name for name in planes):
-            raise ValueError("GroupedDBuffer plane names must be non-empty.")
-
-        self.planes = dict(planes)
-        self.tensor = None
-        first_plane = next(iter(self.planes.values()))
-        self.mesh = first_plane.mesh
-        self.placements = first_plane.placements
-        for name, plane in self.planes.items():
-            if plane.mesh != self.mesh:
-                raise ValueError(
-                    f"Plane {name!r} uses mesh {plane.mesh!r}, expected {self.mesh!r}."
-                )
-            if plane.placements != self.placements:
-                raise ValueError(
-                    f"Plane {name!r} uses placements {plane.placements!r}, "
-                    f"expected {self.placements!r}."
-                )
-
-    @classmethod
-    def from_mxfp8(
-        cls, tensors: Sequence[torch.Tensor], mesh: DeviceMesh, placements: Sequence[Placement]
-    ) -> Self:
-        """Create MXFP8 grouped storage for the requested placement state."""
-        if len(tensors) != 1:
-            raise NotImplementedError("Experimental MXFP8 MFSDP supports one parameter per group.")
-        tensor = tensors[0]
-        if not is_mxfp8_tensor(tensor) or tensor.ndim != 2:
-            raise TypeError("GroupedDBuffer.from_mxfp8() requires a 2D materialized MXFP8Tensor.")
-        result = cls(
+    def __init__(
+        self,
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        tensor_shapes: Iterable[torch.Size],
+        device: torch.device | str,
+        *,
+        block_size: int = 1,
+    ) -> None:
+        tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
+        if not tensor_shapes or any(len(shape) != 2 for shape in tensor_shapes):
+            raise ValueError("GroupedDBuffer requires one or more 2D MXFP8 tensor shapes.")
+        placements = tuple(placements)
+        self._set_planes(
             {
-                "rowwise_data": DBuffer.distribute_tensors(
-                    [tensor._rowwise_data], mesh, placements, block_size=_MXFP8_BLOCK_SIZE
+                "rowwise_data": DBuffer(
+                    mesh, placements, tensor_shapes, torch.uint8, device, block_size=block_size
                 ),
-                "columnwise_data": DBuffer.distribute_tensors(
-                    [tensor._columnwise_data], mesh, placements, block_size=_MXFP8_BLOCK_SIZE
+                "columnwise_data": DBuffer(
+                    mesh, placements, tensor_shapes, torch.uint8, device, block_size=block_size
                 ),
-                "rowwise_scale": DBuffer.distribute_tensors(
-                    [cls._compact_rowwise_scale(tensor)],
+                "rowwise_scale": DBuffer(
                     mesh,
                     placements,
-                    block_size=_MXFP8_BLOCK_SIZE,
+                    (torch.Size((shape[0], shape[1] // 32)) for shape in tensor_shapes),
+                    torch.uint8,
+                    device,
+                    block_size=block_size,
                 ),
-                "columnwise_scale": DBuffer.distribute_tensors(
-                    [cls._compact_columnwise_scale(tensor)], mesh, placements
+                "columnwise_scale": DBuffer(
+                    mesh,
+                    placements,
+                    (torch.Size((shape[0] // 32, shape[1])) for shape in tensor_shapes),
+                    torch.uint8,
+                    device,
                 ),
             }
         )
-        if all(isinstance(placement, Replicate) for placement in placements):
-            result.tensor = tensor
-        else:
-            if tensor.shape[0] % _MXFP8_BLOCK_SIZE or mesh.size() != 2:
-                raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
-            local_rows = tensor.shape[0] // mesh.size()
-            if local_rows % _MXFP8_BLOCK_SIZE:
-                raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
-            result.tensor = tensor.split(local_rows, dim=0)[mesh.get_local_rank()]
-        result.bind_tensor()
+
+    @classmethod
+    def _from_planes(cls, planes: dict[str, DBuffer]) -> Self:
+        """Create a composed view from already-allocated plane DBuffers."""
+        result = cls.__new__(cls)
+        result._set_planes(planes)
         return result
+
+    def _set_planes(self, planes: dict[str, DBuffer]) -> None:
+        """Install internally constructed plane DBuffers with a shared mesh and placement."""
+        self.planes = planes
+        first_plane = next(iter(planes.values()))
+        self.mesh = first_plane.mesh
+        self.placements = first_plane.placements
 
     @staticmethod
     def _compact_rowwise_scale(tensor: torch.Tensor) -> torch.Tensor:
@@ -138,29 +125,45 @@ class GroupedDBuffer:
         destination.zero_()
         destination[: source.shape[0], : source.shape[1]].copy_(source)
 
-    def bind_tensor(self) -> None:
-        """Bind this buffer's physical planes to its matching TE wrapper."""
-        assert self.tensor is not None
-        self.tensor._rowwise_data = self.plane("rowwise_data").get_local_tensor(0)
-        self.tensor._columnwise_data = self.plane("columnwise_data").get_local_tensor(0)
-        self._unpack_scale(
-            self.tensor._rowwise_scale_inv, self.plane("rowwise_scale").get_local_tensor(0)
+    def get_local_tensor(self, index: int) -> torch.Tensor:
+        """Construct a TE MXFP8 wrapper from this rank's four physical-plane views."""
+        rowwise_data = self.plane("rowwise_data").get_local_tensor(index)
+        fp8_dtype = tex.DType.kFloat8E4M3
+        prototype = MXFP8Quantizer(fp8_dtype)(
+            torch.zeros(rowwise_data.shape, dtype=torch.bfloat16, device=rowwise_data.device)
         )
         self._unpack_scale(
-            self.tensor._columnwise_scale_inv, self.plane("columnwise_scale").get_local_tensor(0)
+            prototype._rowwise_scale_inv, self.plane("rowwise_scale").get_local_tensor(index)
+        )
+        self._unpack_scale(
+            prototype._columnwise_scale_inv, self.plane("columnwise_scale").get_local_tensor(index)
+        )
+        return MXFP8Tensor(
+            shape=rowwise_data.shape,
+            dtype=torch.bfloat16,
+            rowwise_data=rowwise_data,
+            rowwise_scale_inv=prototype._rowwise_scale_inv,
+            columnwise_data=self.plane("columnwise_data").get_local_tensor(index),
+            columnwise_scale_inv=prototype._columnwise_scale_inv,
+            fp8_dtype=fp8_dtype,
+            quantizer=MXFP8Quantizer(fp8_dtype),
+            with_gemm_swizzled_scales=False,
+            device=rowwise_data.device,
+            requires_grad=False,
         )
 
     def sync_from_main(self, main_weight: DBuffer) -> None:
         """Quantize the local FP32 master shard into MXFP8 grouped planes."""
-        assert self.tensor is not None
-        with torch.no_grad():
-            self.tensor.quantize_(main_weight.get_local_tensor(0))
-        self.plane("rowwise_scale").get_local_tensor(0).copy_(
-            self._compact_rowwise_scale(self.tensor)
-        )
-        self.plane("columnwise_scale").get_local_tensor(0).copy_(
-            self._compact_columnwise_scale(self.tensor)
-        )
+        for index in range(len(self.plane("rowwise_data").layout.tensor_shapes)):
+            tensor = self.get_local_tensor(index)
+            with torch.no_grad():
+                tensor.quantize_(main_weight.get_local_tensor(index))
+            self.plane("rowwise_scale").get_local_tensor(index).copy_(
+                self._compact_rowwise_scale(tensor)
+            )
+            self.plane("columnwise_scale").get_local_tensor(index).copy_(
+                self._compact_columnwise_scale(tensor)
+            )
 
     @property
     def plane_names(self) -> tuple[str, ...]:
@@ -191,7 +194,9 @@ class GroupedDBuffer:
 
     def view(self, placements: Iterable[Placement]) -> Self:
         """Return a storage-sharing view of every physical plane."""
-        return type(self)({name: plane.view(placements) for name, plane in self.planes.items()})
+        return type(self)._from_planes(
+            {name: plane.view(placements) for name, plane in self.planes.items()}
+        )
 
     def redistribute(self, new_placements: Iterable[Placement], *, out: Self | None = None) -> Self:
         """Redistribute every plane with the same placement transition."""
@@ -216,7 +221,7 @@ class GroupedDBuffer:
             # object identity.  Preserve that contract for the composite too.
             assert all(result_planes[name] is out.planes[name] for name in result_planes)
             return out
-        return type(self)(result_planes)
+        return type(self)._from_planes(result_planes)
 
     def allgather(self, mesh_axis: int, *, out: Self | None = None) -> Self:
         """All-gather every materialized physical plane on ``mesh_axis``."""
@@ -229,4 +234,4 @@ class GroupedDBuffer:
         if out is not None:
             assert all(result_planes[name] is out.planes[name] for name in result_planes)
             return out
-        return type(self)(result_planes)
+        return type(self)._from_planes(result_planes)

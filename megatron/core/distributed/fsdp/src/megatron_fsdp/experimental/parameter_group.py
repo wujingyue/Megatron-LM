@@ -181,11 +181,20 @@ class FsdpParameterGroup:
             self._symm_mem_pool = None
 
         if is_mxfp8:
-            self.model_weight = GroupedDBuffer.from_mxfp8(
-                list(parameter_to_fqns), self.mesh, model_weight_placements
+            self.model_weight = GroupedDBuffer(
+                self.mesh,
+                model_weight_placements,
+                tensor_shapes,
+                self.main_weight.device,
+                block_size=block_size,
             )
-            self._unsharded_model_weight = GroupedDBuffer.from_mxfp8(
-                list(parameter_to_fqns), self.mesh, [Replicate()] * self.mesh.ndim
+            self.model_weight.sync_from_main(self.main_weight)
+            self._unsharded_model_weight = GroupedDBuffer(
+                self.mesh,
+                [Replicate()] * self.mesh.ndim,
+                tensor_shapes,
+                self.main_weight.device,
+                block_size=block_size,
             )
             self.post_optimizer_model_weight = self.model_weight
             self._model_weight_is_stale = False
@@ -253,11 +262,12 @@ class FsdpParameterGroup:
             if isinstance(self.model_weight, GroupedDBuffer):
                 if not is_mxfp8_tensor(parameter):
                     raise TypeError("MXFP8 parameter group contains a non-MXFP8 parameter.")
-                unsharded_tensor = parameter
+                assert isinstance(self._unsharded_model_weight, GroupedDBuffer)
+                unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
             else:
                 assert self._unsharded_model_weight is not None
                 unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
-            if parameter.is_meta:
+            if parameter.is_meta or isinstance(self.model_weight, GroupedDBuffer):
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
                 # This may be problematic if attributes from the original Parameter need
@@ -326,7 +336,12 @@ class FsdpParameterGroup:
             self.model_weight.redistribute(
                 [Replicate()] * self.mesh.ndim, out=self._unsharded_model_weight
             )
-            self._unsharded_model_weight.bind_tensor()
+            for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+                materialized_parameter = nn.Parameter(
+                    self._unsharded_model_weight.get_local_tensor(index),
+                    requires_grad=fsdp_parameter.unsharded.requires_grad,
+                )
+                torch.utils.swap_tensors(fsdp_parameter.unsharded, materialized_parameter)
             self._switch_to_unsharded_parameters()
             return
         assert isinstance(self.model_weight, DBuffer)

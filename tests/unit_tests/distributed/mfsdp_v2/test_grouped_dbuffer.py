@@ -13,7 +13,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.grouped_dbuffer import (
     GroupedDBuffer,
 )
@@ -24,21 +23,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement imp
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 
-def _planes(device: torch.device) -> dict[str, list[torch.Tensor]]:
-    return {
-        "rowwise_data": [
-            torch.arange(64, dtype=torch.uint8, device=device).reshape(4, 16),
-            torch.arange(64, 128, dtype=torch.uint8, device=device).reshape(4, 16),
-        ],
-        "rowwise_scale": [
-            torch.arange(16, dtype=torch.uint8, device=device).reshape(4, 4),
-            torch.arange(16, 32, dtype=torch.uint8, device=device).reshape(4, 4),
-        ],
-        "columnwise_data": [
-            torch.arange(32, dtype=torch.uint8, device=device).reshape(2, 16),
-            torch.arange(32, 64, dtype=torch.uint8, device=device).reshape(2, 16),
-        ],
-    }
+def _grouped(mesh, placements, device: torch.device) -> GroupedDBuffer:
+    return GroupedDBuffer(mesh, placements, [(64, 64)], device, block_size=32)
 
 
 def test_grouped_dbuffer_allgathers_every_plane(distributed_setup):
@@ -47,61 +33,31 @@ def test_grouped_dbuffer_allgathers_every_plane(distributed_setup):
         pytest.skip("GroupedDBuffer all-gather requires at least two ranks.")
 
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    expected = _planes(distributed_setup.device)
-    grouped = GroupedDBuffer(
-        {
-            name: DBuffer.distribute_tensors(tensors, mesh, [Flat()])
-            for name, tensors in expected.items()
-        }
-    )
+    grouped = _grouped(mesh, [Flat()], distributed_setup.device)
+    for plane in grouped.planes.values():
+        plane.local_buffer.fill_(mesh.get_local_rank())
 
     result = grouped.allgather(0)
 
     assert result.placements == (Replicate(),)
-    assert result.plane_names == tuple(expected)
-    for name, tensors in expected.items():
-        for index, tensor in enumerate(tensors):
-            torch.testing.assert_close(result.plane(name).get_local_tensor(index), tensor)
-
-
-def test_grouped_dbuffer_requires_matching_collective_state(distributed_setup):
-    """A composed buffer rejects planes that would take different collectives."""
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    tensors = _planes(distributed_setup.device)
-    with pytest.raises(ValueError, match="placements"):
-        GroupedDBuffer(
-            {
-                "rowwise_data": DBuffer.distribute_tensors(tensors["rowwise_data"], mesh, [Flat()]),
-                "rowwise_scale": DBuffer.distribute_tensors(
-                    tensors["rowwise_scale"], mesh, [Replicate()]
-                ),
-            }
-        )
+    assert result.plane_names == (
+        "rowwise_data",
+        "columnwise_data",
+        "rowwise_scale",
+        "columnwise_scale",
+    )
+    for plane in result.planes.values():
+        assert plane.local_buffer.view(mesh.size(), -1)[0].eq(0).all()
+        assert plane.local_buffer.view(mesh.size(), -1)[1].eq(1).all()
 
 
 def test_grouped_dbuffer_redistributes_into_matching_destinations(distributed_setup):
     """A preallocated grouped destination preserves every plane allocation."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    expected = _planes(distributed_setup.device)
-    source = GroupedDBuffer(
-        {
-            name: DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
-            for name, tensors in expected.items()
-        }
-    )
-    destination = GroupedDBuffer(
-        {
-            name: DBuffer(
-                mesh=mesh,
-                placements=[Flat()],
-                tensor_shapes=plane.layout.tensor_shapes,
-                dtype=plane.dtype,
-                device=plane.device,
-                block_size=plane.layout.block_size,
-            )
-            for name, plane in source.planes.items()
-        }
-    )
+    source = _grouped(mesh, [Replicate()], distributed_setup.device)
+    for plane in source.planes.values():
+        plane.local_buffer.copy_(torch.arange(plane.local_buffer.numel(), device=plane.device))
+    destination = _grouped(mesh, [Flat()], distributed_setup.device)
     data_ptrs = {name: plane.local_buffer.data_ptr() for name, plane in destination.planes.items()}
 
     result = source.redistribute([Flat()], out=destination)
@@ -144,9 +100,9 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
     assert isinstance(parameter_group.model_weight, GroupedDBuffer)
     assert parameter_group.post_optimizer_model_weight is parameter_group.model_weight
     assert parameter_group.main_weight.placements == (BlockAtomic(32),)
-    assert parameter_group.model_weight.tensor.shape == (32, 64)
+    assert parameter_group.model_weight.get_local_tensor(0).shape == (32, 64)
     assert isinstance(parameter_group._unsharded_model_weight, GroupedDBuffer)
-    assert parameter_group._unsharded_model_weight.tensor.shape == (64, 64)
+    assert parameter_group._unsharded_model_weight.get_local_tensor(0).shape == (64, 64)
 
     optimizer = torch.optim.SGD(linear.parameters(), lr=0.1)
     fully_shard_optimizer(optimizer)
