@@ -606,9 +606,13 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
+    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad, is_mxfp8_tensor(parameter))
+        # MXFP8 presents its nominal compute dtype (normally BF16), but MFSDP stores
+        # its physical planes as uint8. Group by that storage dtype to keep the two
+        # representations separate without a second MXFP8 discriminator.
+        storage_dtype = torch.uint8 if is_mxfp8_tensor(parameter) else parameter.dtype
+        key = (storage_dtype, parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
