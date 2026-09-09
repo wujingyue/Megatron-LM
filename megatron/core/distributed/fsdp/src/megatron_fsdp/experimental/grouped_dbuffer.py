@@ -23,6 +23,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import HAVE_TE_MXFP8TENSOR
 from .dbuffer import DBuffer
+from .placement import BlockAtomic, Flat
 
 if HAVE_TE_MXFP8TENSOR:
     import transformer_engine_torch as tex
@@ -88,7 +89,7 @@ class GroupedDBuffer:
                 ),
                 "columnwise_scale": DBuffer(
                     mesh,
-                    placements,
+                    self._plane_placements("columnwise_scale", placements),
                     (torch.Size((shape[0] // 32, shape[1])) for shape in tensor_shapes),
                     torch.uint8,
                     device,
@@ -109,6 +110,16 @@ class GroupedDBuffer:
         first_plane = next(iter(planes.values()))
         self.mesh = first_plane.mesh
         self.placements = first_plane.placements
+
+    @staticmethod
+    def _plane_placements(name: str, placements: Iterable[Placement]) -> tuple[Placement, ...]:
+        """Map logical MXFP8 placements to one physical plane's coordinates."""
+        placements = tuple(placements)
+        if name != "columnwise_scale":
+            return placements
+        return tuple(
+            Flat() if isinstance(placement, BlockAtomic) else placement for placement in placements
+        )
 
     @staticmethod
     def _compact_rowwise_scale(tensor: torch.Tensor) -> torch.Tensor:
@@ -195,7 +206,10 @@ class GroupedDBuffer:
     def view(self, placements: Iterable[Placement]) -> Self:
         """Return a storage-sharing view of every physical plane."""
         return type(self)._from_planes(
-            {name: plane.view(placements) for name, plane in self.planes.items()}
+            {
+                name: plane.view(self._plane_placements(name, placements))
+                for name, plane in self.planes.items()
+            }
         )
 
     def redistribute(self, new_placements: Iterable[Placement], *, out: Self | None = None) -> Self:
@@ -213,7 +227,10 @@ class GroupedDBuffer:
                     f"Expected out placements {new_placements!r}, got {out.placements!r}."
                 )
         result_planes = {
-            name: plane.redistribute(new_placements, out=None if out is None else out.planes[name])
+            name: plane.redistribute(
+                self._plane_placements(name, new_placements),
+                out=None if out is None else out.planes[name],
+            )
             for name, plane in self.planes.items()
         }
         if out is not None:
