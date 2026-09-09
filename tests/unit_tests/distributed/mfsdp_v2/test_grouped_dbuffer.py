@@ -34,19 +34,13 @@ def test_grouped_dbuffer_allgathers_every_plane(distributed_setup):
 
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     grouped = _grouped(mesh, [Flat()], distributed_setup.device)
-    for plane in grouped.planes.values():
+    for plane in grouped.planes:
         plane.local_buffer.fill_(mesh.get_local_rank())
 
     result = grouped.allgather(0)
 
     assert result.placements == (Replicate(),)
-    assert result.plane_names == (
-        "rowwise_data",
-        "columnwise_data",
-        "rowwise_scale",
-        "columnwise_scale",
-    )
-    for plane in result.planes.values():
+    for plane in result.planes:
         assert plane.local_buffer.view(mesh.size(), -1)[0].eq(0).all()
         assert plane.local_buffer.view(mesh.size(), -1)[1].eq(1).all()
 
@@ -55,15 +49,15 @@ def test_grouped_dbuffer_redistributes_into_matching_destinations(distributed_se
     """A preallocated grouped destination receives every plane."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     source = _grouped(mesh, [Replicate()], distributed_setup.device)
-    for plane in source.planes.values():
+    for plane in source.planes:
         plane.local_buffer.copy_(torch.arange(plane.local_buffer.numel(), device=plane.device))
     destination = _grouped(mesh, [Flat()], distributed_setup.device)
     result = source.redistribute([Flat()], out=destination)
 
     assert result is destination
-    for name, plane in destination.planes.items():
+    for result_plane, source_plane in zip(result.planes, source.planes):
         torch.testing.assert_close(
-            result.plane(name).allgather(0).local_buffer, source.plane(name).local_buffer
+            result_plane.allgather(0).local_buffer, source_plane.local_buffer
         )
 
 

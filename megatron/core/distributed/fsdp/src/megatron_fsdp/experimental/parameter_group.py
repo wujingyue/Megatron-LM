@@ -380,7 +380,7 @@ class FsdpParameterGroup:
             assert isinstance(self._unsharded_model_weight, GroupedDBuffer)
             self._unsharded_model_weight.reallocate_storage()
             preserved_tensors = tuple(
-                plane.local_buffer for plane in self._unsharded_model_weight.planes.values()
+                plane.local_buffer for plane in self._unsharded_model_weight.planes
             )
             with torch.autograd._unsafe_preserve_version_counter(preserved_tensors):
                 self.model_weight.redistribute(

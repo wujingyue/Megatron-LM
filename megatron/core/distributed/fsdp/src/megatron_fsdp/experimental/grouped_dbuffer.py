@@ -60,7 +60,10 @@ class GroupedDBuffer:
 
     mesh: DeviceMesh
     placements: tuple[Placement, ...]
-    planes: dict[str, DBuffer]
+    rowwise_data: DBuffer
+    columnwise_data: DBuffer
+    rowwise_scale: DBuffer
+    columnwise_scale: DBuffer
 
     def __init__(
         self,
@@ -97,33 +100,46 @@ class GroupedDBuffer:
                 for shape in tensor_shapes
             ),
         }
-        self._set_planes(
-            {
-                name: DBuffer(
-                    mesh,
-                    self._plane_placements(name, placements),
-                    shapes,
-                    torch.uint8,
-                    device,
-                    block_size=block_size if name != "columnwise_scale" else 1,
-                )
-                for name, shapes in plane_shapes.items()
-            }
+        planes = tuple(
+            DBuffer(
+                mesh,
+                self._plane_placements(name, placements),
+                shapes,
+                torch.uint8,
+                device,
+                block_size=block_size if name != "columnwise_scale" else 1,
+            )
+            for name, shapes in plane_shapes.items()
         )
+        self._set_planes(*planes)
 
     @classmethod
-    def _from_planes(cls, planes: dict[str, DBuffer]) -> Self:
-        """Create a composed view from already-allocated plane DBuffers."""
+    def _from_planes(
+        cls,
+        rowwise_data: DBuffer,
+        columnwise_data: DBuffer,
+        rowwise_scale: DBuffer,
+        columnwise_scale: DBuffer,
+    ) -> Self:
+        """Create a composed view from already-allocated physical planes."""
         result = cls.__new__(cls)
-        result._set_planes(planes)
+        result._set_planes(rowwise_data, columnwise_data, rowwise_scale, columnwise_scale)
         return result
 
-    def _set_planes(self, planes: dict[str, DBuffer]) -> None:
-        """Install internally constructed plane DBuffers with a shared mesh and placement."""
-        self.planes = planes
-        first_plane = next(iter(planes.values()))
-        self.mesh = first_plane.mesh
-        self.placements = first_plane.placements
+    def _set_planes(
+        self,
+        rowwise_data: DBuffer,
+        columnwise_data: DBuffer,
+        rowwise_scale: DBuffer,
+        columnwise_scale: DBuffer,
+    ) -> None:
+        """Install physical planes with the rowwise data plane's logical layout."""
+        self.rowwise_data = rowwise_data
+        self.columnwise_data = columnwise_data
+        self.rowwise_scale = rowwise_scale
+        self.columnwise_scale = columnwise_scale
+        self.mesh = rowwise_data.mesh
+        self.placements = rowwise_data.placements
 
     @staticmethod
     def _plane_placements(name: str, placements: Iterable[Placement]) -> tuple[Placement, ...]:
@@ -137,15 +153,15 @@ class GroupedDBuffer:
 
     def get_local_tensor(self, index: int) -> torch.Tensor:
         """Construct a TE MXFP8 wrapper from this rank's four physical-plane views."""
-        rowwise_data = self.plane("rowwise_data").get_local_tensor(index)
+        rowwise_data = self.rowwise_data.get_local_tensor(index)
         fp8_dtype = tex.DType.kFloat8E4M3
         return MXFP8Tensor(
             shape=rowwise_data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
-            rowwise_scale_inv=self.plane("rowwise_scale").get_local_tensor(index),
-            columnwise_data=self.plane("columnwise_data").get_local_tensor(index),
-            columnwise_scale_inv=self.plane("columnwise_scale").get_local_tensor(index),
+            rowwise_scale_inv=self.rowwise_scale.get_local_tensor(index),
+            columnwise_data=self.columnwise_data.get_local_tensor(index),
+            columnwise_scale_inv=self.columnwise_scale.get_local_tensor(index),
             fp8_dtype=fp8_dtype,
             quantizer=MXFP8Quantizer(fp8_dtype),
             with_gemm_swizzled_scales=False,
@@ -155,80 +171,70 @@ class GroupedDBuffer:
 
     def sync_from_main(self, main_weight: DBuffer) -> None:
         """Quantize the local FP32 master shard into MXFP8 grouped planes."""
-        for index in range(len(self.plane("rowwise_data").layout.tensor_shapes)):
+        for index in range(len(self.rowwise_data.layout.tensor_shapes)):
             tensor = self.get_local_tensor(index)
             with torch.no_grad():
                 tensor.quantize_(main_weight.get_local_tensor(index))
 
     @property
-    def plane_names(self) -> tuple[str, ...]:
-        """Names of the physical planes in stable construction order."""
-        return _PLANE_NAMES
+    def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:
+        """Physical planes in TE's rowwise-data-first order."""
+        return self.rowwise_data, self.columnwise_data, self.rowwise_scale, self.columnwise_scale
 
     @property
     def is_symmetric_memory(self) -> bool:
         """Whether every plane is backed by symmetric memory."""
-        return all(plane.is_symmetric_memory for plane in self.planes.values())
+        return all(plane.is_symmetric_memory for plane in self.planes)
 
-    def plane(self, name: str) -> DBuffer:
-        """Return the named physical DBuffer."""
-        return self.planes[name]
-
-    def _result(self, planes: dict[str, DBuffer], out: Self | None) -> Self:
+    def _result(self, planes: tuple[DBuffer, DBuffer, DBuffer, DBuffer], out: Self | None) -> Self:
         """Return constructed plane results or preserve a supplied destination."""
         if out is None:
-            return type(self)._from_planes(planes)
-        assert all(planes[name] is out.planes[name] for name in planes)
+            return type(self)._from_planes(*planes)
+        assert all(result is destination for result, destination in zip(planes, out.planes))
         return out
 
     def reallocate_storage(self) -> None:
         """Restore every plane's backing storage."""
-        for plane in self.planes.values():
+        for plane in self.planes:
             plane.reallocate_storage()
 
     def release_storage(self) -> None:
         """Release every plane's backing storage while retaining aliases."""
-        for plane in self.planes.values():
+        for plane in self.planes:
             plane.release_storage()
 
     def view(self, placements: Iterable[Placement]) -> Self:
         """Return a storage-sharing view of every physical plane."""
         return type(self)._from_planes(
-            {
-                name: plane.view(self._plane_placements(name, placements))
-                for name, plane in self.planes.items()
-            }
+            *(
+                plane.view(self._plane_placements(name, placements))
+                for name, plane in zip(_PLANE_NAMES, self.planes)
+            )
         )
 
     def redistribute(self, new_placements: Iterable[Placement], *, out: Self | None = None) -> Self:
         """Redistribute every plane with the same placement transition."""
         new_placements = tuple(new_placements)
         if out is not None:
-            if out.plane_names != self.plane_names:
-                raise ValueError(
-                    f"Expected out planes {self.plane_names!r}, got {out.plane_names!r}."
-                )
             if out.mesh != self.mesh:
                 raise ValueError(f"Expected out mesh {self.mesh!r}, got {out.mesh!r}.")
             if out.placements != new_placements:
                 raise ValueError(
                     f"Expected out placements {new_placements!r}, got {out.placements!r}."
                 )
-        result_planes = {
-            name: plane.redistribute(
+        result_planes = tuple(
+            plane.redistribute(
                 self._plane_placements(name, new_placements),
-                out=None if out is None else out.planes[name],
+                out=None if out is None else out.planes[index],
             )
-            for name, plane in self.planes.items()
-        }
+            for index, (name, plane) in enumerate(zip(_PLANE_NAMES, self.planes))
+        )
         return self._result(result_planes, out)
 
     def allgather(self, mesh_axis: int, *, out: Self | None = None) -> Self:
         """All-gather every materialized physical plane on ``mesh_axis``."""
-        if out is not None and out.plane_names != self.plane_names:
-            raise ValueError(f"Expected out planes {self.plane_names!r}, got {out.plane_names!r}.")
-        result_planes = {
-            name: plane.allgather(mesh_axis, out=None if out is None else out.planes[name])
-            for name, plane in self.planes.items()
-        }
+        result_planes = tuple(
+            plane.allgather(mesh_axis, out=None if out is None else out.planes[index])
+            for index, plane in enumerate(self.planes)
+        )
         return self._result(result_planes, out)
