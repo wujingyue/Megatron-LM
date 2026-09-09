@@ -220,7 +220,6 @@ class FsdpModule:
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
-                    is_mxfp8=is_mxfp8,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)

@@ -62,6 +62,30 @@ def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> 
         parameter_group.sync_model_weight_from_main_weight()
 
 
+def _mxfp8_initial_values(parameters: Iterable[nn.Parameter]) -> tuple[torch.Tensor, ...] | None:
+    """Return TE's preserved master-weight values, if available for every parameter."""
+    values = tuple(
+        (
+            get_high_precision_init_val()
+            if (
+                get_high_precision_init_val := getattr(
+                    parameter, "get_high_precision_init_val", None
+                )
+            )
+            else None
+        )
+        for parameter in parameters
+    )
+    if not any(value is not None for value in values):
+        return None
+    if not all(value is not None for value in values):
+        raise ValueError(
+            "MXFP8 parameter group has a mixture of preserved and missing high-precision "
+            "initialization values."
+        )
+    return tuple(value for value in values if value is not None)
+
+
 @dataclass(frozen=True, eq=False)
 class FsdpParameter:
     """One physical parameter and its FSDP runtime representations."""
@@ -113,7 +137,6 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
-        is_mxfp8: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -145,6 +168,7 @@ class FsdpParameterGroup:
         self.mesh = mesh
         self.grad_divisor = grad_divisor
         first_parameter = next(iter(parameter_to_fqns))
+        is_mxfp8 = is_mxfp8_tensor(first_parameter)
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
         for parameter, fqns in parameter_to_fqns.items():
@@ -158,6 +182,8 @@ class FsdpParameterGroup:
                     f"Expected parameter {fqns!r} to have requires_grad={self.requires_grad}, "
                     f"got {parameter.requires_grad}."
                 )
+            if is_mxfp8_tensor(parameter) != is_mxfp8:
+                raise TypeError("FSDP parameter groups cannot mix MXFP8 and non-MXFP8 tensors.")
 
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         block_size = 1
@@ -167,38 +193,13 @@ class FsdpParameterGroup:
                     block_size = math.lcm(block_size, placement.block_size)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
-        high_precision_init_values: tuple[torch.Tensor | None, ...] = ()
-        has_high_precision_init_values = False
-        if is_mxfp8:
-            high_precision_init_values = tuple(
-                (
-                    get_high_precision_init_val()
-                    if (
-                        get_high_precision_init_val := getattr(
-                            parameter, "get_high_precision_init_val", None
-                        )
-                    )
-                    else None
-                )
-                for parameter in parameter_to_fqns
-            )
-            if any(value is not None for value in high_precision_init_values) and not all(
-                value is not None for value in high_precision_init_values
-            ):
-                raise ValueError(
-                    "MXFP8 parameter group has a mixture of preserved and missing high-precision "
-                    "initialization values."
-                )
-            has_high_precision_init_values = all(
-                value is not None for value in high_precision_init_values
-            )
+        high_precision_init_values = _mxfp8_initial_values(parameter_to_fqns) if is_mxfp8 else None
 
-        if has_high_precision_init_values:
+        if high_precision_init_values is not None:
             self.main_weight = DBuffer.distribute_tensors(
                 (
                     value.to(device=first_parameter.device, dtype=main_weight_dtype)
                     for value in high_precision_init_values
-                    if value is not None
                 ),
                 mesh=self.mesh,
                 placements=main_weight_placements,
@@ -239,7 +240,7 @@ class FsdpParameterGroup:
                 self.main_weight.device,
                 block_size=block_size,
             )
-            if has_high_precision_init_values:
+            if high_precision_init_values is not None:
                 self.model_weight.sync_from_main(self.main_weight)
             self._unsharded_model_weight = GroupedDBuffer(
                 self.mesh,
@@ -311,14 +312,7 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            if isinstance(self.model_weight, GroupedDBuffer):
-                if not is_mxfp8_tensor(parameter):
-                    raise TypeError("MXFP8 parameter group contains a non-MXFP8 parameter.")
-                assert isinstance(self._unsharded_model_weight, GroupedDBuffer)
-                unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
-            else:
-                assert self._unsharded_model_weight is not None
-                unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
+            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.

@@ -35,6 +35,7 @@ _MXFP8_BLOCK_SIZE = 32
 _MXFP8_ROWWISE_SCALE_ALIGNMENT = 128
 _MXFP8_COLUMNWISE_SCALE_ALIGNMENT = 128
 _MXFP8_SCALE_ROW_ALIGNMENT = 4
+_PLANE_NAMES = ("rowwise_data", "columnwise_data", "rowwise_scale", "columnwise_scale")
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -44,8 +45,7 @@ def _round_up(value: int, multiple: int) -> int:
 def is_mxfp8_tensor(tensor: torch.Tensor) -> bool:
     """Whether ``tensor`` is a TE MXFP8 tensor with both physical data planes."""
     return (
-        HAVE_TE_MXFP8TENSOR
-        and isinstance(tensor, MXFP8Tensor)
+        isinstance(tensor, MXFP8Tensor)
         and tensor._rowwise_data is not None
         and tensor._columnwise_data is not None
     )
@@ -55,8 +55,7 @@ class GroupedDBuffer:
     """The MFSDP storage and lifecycle for one TE MXFP8 tensor.
 
     The data and scale planes can have different dtypes, logical shapes, and
-    layouts, but share mesh and placement state.  The direct-plane constructor
-    is retained for constructing the replicated staging storage internally.
+    layouts, but share mesh and placement state.
     """
 
     mesh: DeviceMesh
@@ -76,49 +75,39 @@ class GroupedDBuffer:
         if not tensor_shapes or any(len(shape) != 2 for shape in tensor_shapes):
             raise ValueError("GroupedDBuffer requires one or more 2D MXFP8 tensor shapes.")
         placements = tuple(placements)
+        plane_shapes = {
+            "rowwise_data": tensor_shapes,
+            "columnwise_data": tensor_shapes,
+            "rowwise_scale": tuple(
+                torch.Size(
+                    (
+                        _round_up(shape[0], _MXFP8_ROWWISE_SCALE_ALIGNMENT),
+                        _round_up(shape[1] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT),
+                    )
+                )
+                for shape in tensor_shapes
+            ),
+            "columnwise_scale": tuple(
+                torch.Size(
+                    (
+                        _round_up(shape[0] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT),
+                        _round_up(shape[1], _MXFP8_COLUMNWISE_SCALE_ALIGNMENT),
+                    )
+                )
+                for shape in tensor_shapes
+            ),
+        }
         self._set_planes(
             {
-                "rowwise_data": DBuffer(
-                    mesh, placements, tensor_shapes, torch.uint8, device, block_size=block_size
-                ),
-                "columnwise_data": DBuffer(
-                    mesh, placements, tensor_shapes, torch.uint8, device, block_size=block_size
-                ),
-                "rowwise_scale": DBuffer(
+                name: DBuffer(
                     mesh,
-                    placements,
-                    (
-                        torch.Size(
-                            (
-                                _round_up(shape[0], _MXFP8_ROWWISE_SCALE_ALIGNMENT),
-                                _round_up(
-                                    shape[1] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT
-                                ),
-                            )
-                        )
-                        for shape in tensor_shapes
-                    ),
+                    self._plane_placements(name, placements),
+                    shapes,
                     torch.uint8,
                     device,
-                    block_size=block_size,
-                ),
-                "columnwise_scale": DBuffer(
-                    mesh,
-                    self._plane_placements("columnwise_scale", placements),
-                    (
-                        torch.Size(
-                            (
-                                _round_up(
-                                    shape[0] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT
-                                ),
-                                _round_up(shape[1], _MXFP8_COLUMNWISE_SCALE_ALIGNMENT),
-                            )
-                        )
-                        for shape in tensor_shapes
-                    ),
-                    torch.uint8,
-                    device,
-                ),
+                    block_size=block_size if name != "columnwise_scale" else 1,
+                )
+                for name, shapes in plane_shapes.items()
             }
         )
 
@@ -174,7 +163,7 @@ class GroupedDBuffer:
     @property
     def plane_names(self) -> tuple[str, ...]:
         """Names of the physical planes in stable construction order."""
-        return tuple(self.planes)
+        return _PLANE_NAMES
 
     @property
     def is_symmetric_memory(self) -> bool:
@@ -183,10 +172,14 @@ class GroupedDBuffer:
 
     def plane(self, name: str) -> DBuffer:
         """Return the named physical DBuffer."""
-        try:
-            return self.planes[name]
-        except KeyError as error:
-            raise KeyError(f"Unknown GroupedDBuffer plane {name!r}.") from error
+        return self.planes[name]
+
+    def _result(self, planes: dict[str, DBuffer], out: Self | None) -> Self:
+        """Return constructed plane results or preserve a supplied destination."""
+        if out is None:
+            return type(self)._from_planes(planes)
+        assert all(planes[name] is out.planes[name] for name in planes)
+        return out
 
     def reallocate_storage(self) -> None:
         """Restore every plane's backing storage."""
@@ -228,12 +221,7 @@ class GroupedDBuffer:
             )
             for name, plane in self.planes.items()
         }
-        if out is not None:
-            # DBuffer's out= contract preserves the destination allocation and
-            # object identity.  Preserve that contract for the composite too.
-            assert all(result_planes[name] is out.planes[name] for name in result_planes)
-            return out
-        return type(self)._from_planes(result_planes)
+        return self._result(result_planes, out)
 
     def allgather(self, mesh_axis: int, *, out: Self | None = None) -> Self:
         """All-gather every materialized physical plane on ``mesh_axis``."""
@@ -243,7 +231,4 @@ class GroupedDBuffer:
             name: plane.allgather(mesh_axis, out=None if out is None else out.planes[name])
             for name, plane in self.planes.items()
         }
-        if out is not None:
-            assert all(result_planes[name] is out.planes[name] for name in result_planes)
-            return out
-        return type(self)._from_planes(result_planes)
+        return self._result(result_planes, out)
