@@ -25,13 +25,11 @@ from ..mixed_precision import HAVE_TE_MXFP8TENSOR
 from .dbuffer import DBuffer
 from .placement import BlockAtomic, Flat
 
-if HAVE_TE_MXFP8TENSOR:
-    import transformer_engine_torch as tex
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
-else:
-    tex = None
-    MXFP8Quantizer = None
-    MXFP8Tensor = None
+if not HAVE_TE_MXFP8TENSOR:
+    raise ImportError("GroupedDBuffer requires Transformer Engine MXFP8 support.")
+
+import transformer_engine_torch as tex
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 
 _MXFP8_BLOCK_SIZE = 32
 
@@ -122,12 +120,12 @@ class GroupedDBuffer:
         )
 
     @staticmethod
-    def _compact_rowwise_scale(tensor: torch.Tensor) -> torch.Tensor:
+    def _compact_rowwise_scale(tensor: MXFP8Tensor) -> torch.Tensor:
         """Remove TE padding from a rowwise scale tensor."""
         return tensor._rowwise_scale_inv[: tensor.shape[0], : tensor.shape[1] // 32].contiguous()
 
     @staticmethod
-    def _compact_columnwise_scale(tensor: torch.Tensor) -> torch.Tensor:
+    def _compact_columnwise_scale(tensor: MXFP8Tensor) -> torch.Tensor:
         """Remove TE padding from a columnwise scale tensor."""
         return tensor._columnwise_scale_inv[: tensor.shape[0] // 32, : tensor.shape[1]].contiguous()
 
