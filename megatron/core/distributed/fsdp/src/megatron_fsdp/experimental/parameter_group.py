@@ -85,8 +85,8 @@ class FsdpParameterGroup:
     requires_grad: bool
     main_weight: DBuffer
     model_weight: DBuffer | GroupedDBuffer
-    # Optimizer-layout view into model_weight storage, avoiding a second allocation.
-    post_optimizer_model_weight: DBuffer | None
+    # Optimizer-layout representation of model_weight after an optimizer step.
+    post_optimizer_model_weight: DBuffer | GroupedDBuffer
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
@@ -187,7 +187,7 @@ class FsdpParameterGroup:
             self._unsharded_model_weight = GroupedDBuffer.from_mxfp8(
                 list(parameter_to_fqns), self.mesh, [Replicate()] * self.mesh.ndim
             )
-            self.post_optimizer_model_weight = None
+            self.post_optimizer_model_weight = self.model_weight
             self._model_weight_is_stale = False
         elif main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
@@ -309,10 +309,10 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
-        if isinstance(self.model_weight, GroupedDBuffer):
-            self.model_weight.sync_from_main(self.main_weight)
+        if isinstance(self.post_optimizer_model_weight, GroupedDBuffer):
+            self.post_optimizer_model_weight.sync_from_main(self.main_weight)
             return
-        assert self.post_optimizer_model_weight is not None
+        assert isinstance(self.model_weight, DBuffer)
         self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
@@ -330,7 +330,7 @@ class FsdpParameterGroup:
             self._switch_to_unsharded_parameters()
             return
         assert isinstance(self.model_weight, DBuffer)
-        assert self.post_optimizer_model_weight is not None
+        assert isinstance(self.post_optimizer_model_weight, DBuffer)
         assert isinstance(self._unsharded_model_weight, DBuffer)
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
