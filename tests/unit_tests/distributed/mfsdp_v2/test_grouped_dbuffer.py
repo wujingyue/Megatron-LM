@@ -62,10 +62,11 @@ def test_grouped_dbuffer_redistributes_into_matching_destinations(distributed_se
 
 
 @pytest.mark.parametrize("preserve_high_precision_init_val", [True, False])
+@pytest.mark.parametrize("parameter_placement", [Shard(0), Replicate()])
 def test_mxfp8_linear_training_step_uses_grouped_dbuffer(
-    distributed_setup, preserve_high_precision_init_val
+    distributed_setup, preserve_high_precision_init_val, parameter_placement
 ):
-    """A bias-free TE MXFP8 Linear completes a ZeRO-3 training step on two ranks."""
+    """A bias-free TE MXFP8 Linear completes a ZeRO-1/3 training step on two ranks."""
     te = pytest.importorskip("transformer_engine")
     if distributed_setup.world_size != 2:
         pytest.skip("MXFP8 grouped DBuffer coverage requires exactly two ranks.")
@@ -93,7 +94,7 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(
         reference.weight.quantize_(reference_main_weight)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     placements = Placements(
-        dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        dp_axes=[0], parameter=[parameter_placement], gradient=[Shard(0)], optimizer=[Shard(0)]
     )
     with fully_shard_context(device=distributed_setup.device):
         fully_shard(
@@ -105,7 +106,10 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(
 
     parameter_group = linear.parameter_groups[0]
     assert isinstance(parameter_group.model_weight, GroupedDBuffer)
-    assert parameter_group.post_optimizer_model_weight is parameter_group.model_weight
+    assert isinstance(parameter_group.post_optimizer_model_weight, GroupedDBuffer)
+    assert (
+        parameter_group.post_optimizer_model_weight is parameter_group.model_weight
+    ) is isinstance(parameter_placement, Shard)
     assert parameter_group.main_weight.placements == (BlockAtomic(32),)
 
     optimizer = torch.optim.SGD(linear.parameters(), lr=0.1)

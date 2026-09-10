@@ -187,6 +187,18 @@ class GroupedDBuffer:
         for plane in self.planes:
             plane.release_storage()
 
+    def view(self, placements: Iterable[Placement]) -> "GroupedDBuffer":
+        """Return a storage-sharing view of every physical plane."""
+        placements = tuple(placements)
+        if self.rowwise_data.placements == placements:
+            return self
+        return GroupedDBuffer._from_planes(
+            self.rowwise_data.view(placements),
+            self.columnwise_data.view(placements),
+            self.rowwise_scale.view(placements),
+            self.columnwise_scale.view(self._columnwise_scale_placements(placements)),
+        )
+
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "GroupedDBuffer | None" = None
     ) -> "GroupedDBuffer":

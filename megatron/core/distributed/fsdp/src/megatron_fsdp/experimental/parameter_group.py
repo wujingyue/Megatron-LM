@@ -214,27 +214,19 @@ class FsdpParameterGroup:
                         device=self.main_weight.device,
                         block_size=block_size,
                     )
-        if isinstance(self.model_weight, GroupedDBuffer):
-            self.model_weight.sync_from_main(self.main_weight)
-            self._unsharded_model_weight = GroupedDBuffer(
-                self.mesh,
-                [Replicate()] * self.mesh.ndim,
-                tensor_shapes,
-                self.main_weight.device,
-                block_size=block_size,
-            )
-            self.post_optimizer_model_weight = self.model_weight
-            self._model_weight_is_stale = False
-        else:
-            assert isinstance(self.model_weight, DBuffer)
-            self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
-            # Cast into the preallocated optimizer-layout view on the current stream.
-            self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
-            self._model_weight_is_stale = (
-                self.post_optimizer_model_weight.placements != self.model_weight.placements
-            )
-
-            with self._symmetric_memory_context():
+        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
+        self.sync_model_weight_from_main_weight()
+        with self._symmetric_memory_context():
+            if isinstance(self.model_weight, GroupedDBuffer):
+                self._unsharded_model_weight = GroupedDBuffer(
+                    self.mesh,
+                    [Replicate()] * self.mesh.ndim,
+                    tensor_shapes,
+                    self.main_weight.device,
+                    block_size=block_size,
+                )
+            else:
+                assert isinstance(self.model_weight, DBuffer)
                 self._unsharded_model_weight = DBuffer(
                     mesh=self.mesh,
                     placements=[Replicate()] * self.mesh.ndim,
@@ -325,6 +317,10 @@ class FsdpParameterGroup:
         """Refresh compute weights from optimizer weights."""
         if isinstance(self.post_optimizer_model_weight, GroupedDBuffer):
             self.post_optimizer_model_weight.sync_from_main(self.main_weight)
+            self._model_weight_is_stale = (
+                self.post_optimizer_model_weight.rowwise_data.placements
+                != self.model_weight.rowwise_data.placements
+            )
             return
         assert isinstance(self.model_weight, DBuffer)
         self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
@@ -336,6 +332,12 @@ class FsdpParameterGroup:
         """Install full parameters for local compute."""
         if isinstance(self.model_weight, GroupedDBuffer):
             assert isinstance(self._unsharded_model_weight, GroupedDBuffer)
+            assert isinstance(self.post_optimizer_model_weight, GroupedDBuffer)
+            if self._model_weight_is_stale:
+                self.post_optimizer_model_weight.redistribute(
+                    self.model_weight.rowwise_data.placements, out=self.model_weight
+                )
+                self._model_weight_is_stale = False
             self._unsharded_model_weight.reallocate_storage()
             preserved_tensors = tuple(
                 plane.local_buffer for plane in self._unsharded_model_weight.planes
