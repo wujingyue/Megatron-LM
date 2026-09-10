@@ -30,7 +30,6 @@ if not HAVE_TE_MXFP8TENSOR:
 import transformer_engine_torch as tex
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 
-_PLANE_NAMES = ("rowwise_data", "columnwise_data", "rowwise_scale", "columnwise_scale")
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
 _MXFP8_QUANTIZER = MXFP8Quantizer(_MXFP8_DTYPE)
 
@@ -88,7 +87,7 @@ class GroupedDBuffer:
         )
         self.columnwise_scale = DBuffer(
             mesh,
-            self._plane_placements("columnwise_scale", placements),
+            self._columnwise_scale_placements(placements),
             (
                 torch.Size(_MXFP8_QUANTIZER.get_scale_shape(shape, columnwise=True))
                 for shape in tensor_shapes
@@ -119,11 +118,13 @@ class GroupedDBuffer:
         return result
 
     @staticmethod
-    def _plane_placements(name: str, placements: Iterable[Placement]) -> tuple[Placement, ...]:
-        """Map logical MXFP8 placements to one physical plane's coordinates."""
+    def _columnwise_scale_placements(placements: Iterable[Placement]) -> tuple[Placement, ...]:
+        """Map weight placements to columnwise-scale coordinates.
+
+        A columnwise scale row describes one 32-row weight block, so it uses
+        Flat instead of BlockAtomic(32) to preserve the same shard boundaries.
+        """
         placements = tuple(placements)
-        if name != "columnwise_scale":
-            return placements
         return tuple(
             Flat() if isinstance(placement, BlockAtomic) else placement for placement in placements
         )
@@ -181,15 +182,6 @@ class GroupedDBuffer:
         for plane in self.planes:
             plane.release_storage()
 
-    def view(self, placements: Iterable[Placement]) -> "GroupedDBuffer":
-        """Return a storage-sharing view of every physical plane."""
-        return type(self)._from_planes(
-            *(
-                plane.view(self._plane_placements(name, placements))
-                for name, plane in zip(_PLANE_NAMES, self.planes)
-            )
-        )
-
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "GroupedDBuffer | None" = None
     ) -> "GroupedDBuffer":
@@ -203,12 +195,20 @@ class GroupedDBuffer:
                     "Expected out rowwise-data placements "
                     f"{new_placements!r}, got {out.rowwise_data.placements!r}."
                 )
-        result_planes = tuple(
-            plane.redistribute(
-                self._plane_placements(name, new_placements),
-                out=None if out is None else out.planes[index],
-            )
-            for index, (name, plane) in enumerate(zip(_PLANE_NAMES, self.planes))
+        result_planes = (
+            self.rowwise_data.redistribute(
+                new_placements, out=None if out is None else out.rowwise_data
+            ),
+            self.columnwise_data.redistribute(
+                new_placements, out=None if out is None else out.columnwise_data
+            ),
+            self.rowwise_scale.redistribute(
+                new_placements, out=None if out is None else out.rowwise_scale
+            ),
+            self.columnwise_scale.redistribute(
+                self._columnwise_scale_placements(new_placements),
+                out=None if out is None else out.columnwise_scale,
+            ),
         )
         return self._result(result_planes, out)
 
