@@ -36,6 +36,8 @@ _MXFP8_ROWWISE_SCALE_ALIGNMENT = 128
 _MXFP8_COLUMNWISE_SCALE_ALIGNMENT = 128
 _MXFP8_SCALE_ROW_ALIGNMENT = 4
 _PLANE_NAMES = ("rowwise_data", "columnwise_data", "rowwise_scale", "columnwise_scale")
+_MXFP8_DTYPE = tex.DType.kFloat8E4M3
+_MXFP8_QUANTIZER = MXFP8Quantizer(_MXFP8_DTYPE)
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -78,10 +80,16 @@ class GroupedDBuffer:
         if not tensor_shapes or any(len(shape) != 2 for shape in tensor_shapes):
             raise ValueError("GroupedDBuffer requires one or more 2D MXFP8 tensor shapes.")
         placements = tuple(placements)
-        plane_shapes = {
-            "rowwise_data": tensor_shapes,
-            "columnwise_data": tensor_shapes,
-            "rowwise_scale": tuple(
+        self.rowwise_data = DBuffer(
+            mesh, placements, tensor_shapes, torch.uint8, device, block_size=block_size
+        )
+        self.columnwise_data = DBuffer(
+            mesh, placements, tensor_shapes, torch.uint8, device, block_size=block_size
+        )
+        self.rowwise_scale = DBuffer(
+            mesh,
+            placements,
+            (
                 torch.Size(
                     (
                         _round_up(shape[0], _MXFP8_ROWWISE_SCALE_ALIGNMENT),
@@ -90,7 +98,14 @@ class GroupedDBuffer:
                 )
                 for shape in tensor_shapes
             ),
-            "columnwise_scale": tuple(
+            torch.uint8,
+            device,
+            block_size=block_size,
+        )
+        self.columnwise_scale = DBuffer(
+            mesh,
+            self._plane_placements("columnwise_scale", placements),
+            (
                 torch.Size(
                     (
                         _round_up(shape[0] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT),
@@ -99,19 +114,11 @@ class GroupedDBuffer:
                 )
                 for shape in tensor_shapes
             ),
-        }
-        planes = tuple(
-            DBuffer(
-                mesh,
-                self._plane_placements(name, placements),
-                shapes,
-                torch.uint8,
-                device,
-                block_size=block_size if name != "columnwise_scale" else 1,
-            )
-            for name, shapes in plane_shapes.items()
+            torch.uint8,
+            device,
         )
-        self._set_planes(*planes)
+        self.mesh = mesh
+        self.placements = placements
 
     @classmethod
     def _from_planes(
@@ -123,23 +130,13 @@ class GroupedDBuffer:
     ) -> Self:
         """Create a composed view from already-allocated physical planes."""
         result = cls.__new__(cls)
-        result._set_planes(rowwise_data, columnwise_data, rowwise_scale, columnwise_scale)
+        result.rowwise_data = rowwise_data
+        result.columnwise_data = columnwise_data
+        result.rowwise_scale = rowwise_scale
+        result.columnwise_scale = columnwise_scale
+        result.mesh = rowwise_data.mesh
+        result.placements = rowwise_data.placements
         return result
-
-    def _set_planes(
-        self,
-        rowwise_data: DBuffer,
-        columnwise_data: DBuffer,
-        rowwise_scale: DBuffer,
-        columnwise_scale: DBuffer,
-    ) -> None:
-        """Install physical planes with the rowwise data plane's logical layout."""
-        self.rowwise_data = rowwise_data
-        self.columnwise_data = columnwise_data
-        self.rowwise_scale = rowwise_scale
-        self.columnwise_scale = columnwise_scale
-        self.mesh = rowwise_data.mesh
-        self.placements = rowwise_data.placements
 
     @staticmethod
     def _plane_placements(name: str, placements: Iterable[Placement]) -> tuple[Placement, ...]:
@@ -154,7 +151,6 @@ class GroupedDBuffer:
     def get_local_tensor(self, index: int) -> torch.Tensor:
         """Construct a TE MXFP8 wrapper from this rank's four physical-plane views."""
         rowwise_data = self.rowwise_data.get_local_tensor(index)
-        fp8_dtype = tex.DType.kFloat8E4M3
         return MXFP8Tensor(
             shape=rowwise_data.shape,
             dtype=torch.bfloat16,
@@ -162,8 +158,8 @@ class GroupedDBuffer:
             rowwise_scale_inv=self.rowwise_scale.get_local_tensor(index),
             columnwise_data=self.columnwise_data.get_local_tensor(index),
             columnwise_scale_inv=self.columnwise_scale.get_local_tensor(index),
-            fp8_dtype=fp8_dtype,
-            quantizer=MXFP8Quantizer(fp8_dtype),
+            fp8_dtype=_MXFP8_DTYPE,
+            quantizer=_MXFP8_QUANTIZER,
             with_gemm_swizzled_scales=False,
             device=rowwise_data.device,
             requires_grad=False,

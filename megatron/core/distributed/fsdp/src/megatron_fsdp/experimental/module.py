@@ -201,21 +201,18 @@ class FsdpModule:
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             first_parameter = next(iter(group_parameters.values()))
-            group_dtype = first_parameter.dtype
-            is_mxfp8 = is_mxfp8_tensor(first_parameter)
+            group_dtype = torch.uint8 if is_mxfp8_tensor(first_parameter) else first_parameter.dtype
             parameter_groups.append(
                 FsdpParameterGroup(
                     owning_module=self,
                     parameters=group_parameters,
                     mesh=mesh,
                     model_weight_placements=_specialize_placements(
-                        model_weight_placements, group_dtype, is_mxfp8=is_mxfp8
+                        model_weight_placements, group_dtype
                     ),
-                    main_grad_placements=_specialize_placements(
-                        main_grad_placements, group_dtype, is_mxfp8=is_mxfp8
-                    ),
+                    main_grad_placements=_specialize_placements(main_grad_placements, group_dtype),
                     main_weight_placements=_specialize_placements(
-                        main_weight_placements, group_dtype, is_mxfp8=is_mxfp8
+                        main_weight_placements, group_dtype
                     ),
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
@@ -611,14 +608,14 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         # MXFP8 presents its nominal compute dtype (normally BF16), but MFSDP stores
         # its physical planes as uint8. Group by that storage dtype to keep the two
         # representations separate without a second MXFP8 discriminator.
-        storage_dtype = torch.uint8 if is_mxfp8_tensor(parameter) else parameter.dtype
-        key = (storage_dtype, parameter.requires_grad)
+        group_dtype = torch.uint8 if is_mxfp8_tensor(parameter) else parameter.dtype
+        key = (group_dtype, parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
 
 def _specialize_placements(
-    placements: tuple[Placement, ...], dtype: torch.dtype, *, is_mxfp8: bool = False
+    placements: tuple[Placement, ...], group_dtype: torch.dtype
 ) -> tuple[Placement, ...]:
     """Specialize public placements for one homogeneous parameter group.
 
@@ -626,14 +623,14 @@ def _specialize_placements(
     DBuffer-specific ``Flat`` format. This dtype-homogeneous group boundary is
     where MXFP8 groups will instead select ``BlockAtomic``.
     """
-    if dtype not in (torch.float32, torch.bfloat16, torch.float16):
-        raise NotImplementedError(f"Unsupported dtype: {dtype}.")
+    if group_dtype not in (torch.uint8, torch.float32, torch.bfloat16, torch.float16):
+        raise NotImplementedError(f"Unsupported group dtype: {group_dtype}.")
     for placement in placements:
         if type(placement) is Shard and placement.dim != 0:
             raise NotImplementedError(
                 "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
             )
-    placement_type = BlockAtomic(32) if is_mxfp8 else Flat()
+    placement_type = BlockAtomic(32) if group_dtype == torch.uint8 else Flat()
     return tuple(
         placement_type if type(placement) is Shard else placement for placement in placements
     )
