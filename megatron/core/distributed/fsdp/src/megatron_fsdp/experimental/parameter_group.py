@@ -62,30 +62,6 @@ def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> 
         parameter_group.sync_model_weight_from_main_weight()
 
 
-def _mxfp8_initial_values(parameters: Iterable[nn.Parameter]) -> tuple[torch.Tensor, ...] | None:
-    """Return TE's preserved master-weight values, if available for every parameter."""
-    values = tuple(
-        (
-            get_high_precision_init_val()
-            if (
-                get_high_precision_init_val := getattr(
-                    parameter, "get_high_precision_init_val", None
-                )
-            )
-            else None
-        )
-        for parameter in parameters
-    )
-    if not any(value is not None for value in values):
-        return None
-    if not all(value is not None for value in values):
-        raise ValueError(
-            "MXFP8 parameter group has a mixture of preserved and missing high-precision "
-            "initialization values."
-        )
-    return tuple(value for value in values if value is not None)
-
-
 @dataclass(frozen=True, eq=False)
 class FsdpParameter:
     """One physical parameter and its FSDP runtime representations."""
@@ -189,39 +165,22 @@ class FsdpParameterGroup:
                     block_size = math.lcm(block_size, placement.block_size)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
-        high_precision_init_values = (
-            _mxfp8_initial_values(parameter_to_fqns) if self.dtype == torch.uint8 else None
+        self.main_weight = DBuffer(
+            mesh=self.mesh,
+            placements=main_weight_placements,
+            tensor_shapes=tensor_shapes,
+            dtype=main_weight_dtype,
+            device=first_parameter.device,
+            block_size=block_size,
         )
-
-        if high_precision_init_values is not None:
-            self.main_weight = DBuffer.distribute_tensors(
-                (
-                    value.to(device=first_parameter.device, dtype=main_weight_dtype)
-                    for value in high_precision_init_values
-                ),
-                mesh=self.mesh,
-                placements=main_weight_placements,
-                block_size=block_size,
-            )
-            for parameter in parameter_to_fqns:
+        for index, parameter in enumerate(parameter_to_fqns):
+            get_high_precision_init_val = getattr(parameter, "get_high_precision_init_val", None)
+            if get_high_precision_init_val:
+                value = get_high_precision_init_val()
                 parameter.clear_high_precision_init_val()
-        elif self.dtype == torch.uint8:
-            # Checkpoint restore will populate main_weight and then regenerate the MXFP8 planes.
-            self.main_weight = DBuffer(
-                mesh=self.mesh,
-                placements=main_weight_placements,
-                tensor_shapes=tensor_shapes,
-                dtype=main_weight_dtype,
-                device=first_parameter.device,
-                block_size=block_size,
-            )
-        else:
-            self.main_weight = DBuffer.distribute_tensors(
-                (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
-                mesh=self.mesh,
-                placements=main_weight_placements,
-                block_size=block_size,
-            )
+            else:
+                value = parameter
+            self.main_weight.copy_tensor(index, value)
 
         if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
@@ -238,8 +197,7 @@ class FsdpParameterGroup:
                 self.main_weight.device,
                 block_size=block_size,
             )
-            if high_precision_init_values is not None:
-                self.model_weight.sync_from_main(self.main_weight)
+            self.model_weight.sync_from_main(self.main_weight)
             self._unsharded_model_weight = GroupedDBuffer(
                 self.mesh,
                 [Replicate()] * self.mesh.ndim,

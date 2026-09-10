@@ -61,7 +61,10 @@ def test_grouped_dbuffer_redistributes_into_matching_destinations(distributed_se
         )
 
 
-def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
+@pytest.mark.parametrize("preserve_high_precision_init_val", [True, False])
+def test_mxfp8_linear_training_step_uses_grouped_dbuffer(
+    distributed_setup, preserve_high_precision_init_val
+):
     """A bias-free TE MXFP8 Linear completes a ZeRO-3 training step on two ranks."""
     te = pytest.importorskip("transformer_engine")
     if distributed_setup.world_size != 2:
@@ -70,15 +73,19 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(distributed_setup):
         pytest.skip("MXFP8 requires Blackwell-or-newer CUDA hardware.")
 
     recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=te.common.recipe.Format.HYBRID)
-    with te.pytorch.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+    with te.pytorch.quantized_model_init(
+        recipe=recipe, preserve_high_precision_init_val=preserve_high_precision_init_val
+    ):
         linear = te.pytorch.Linear(
             64, 256, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
         )
         reference = te.pytorch.Linear(
             64, 256, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
         )
+    get_high_precision_init_val = getattr(linear.weight, "get_high_precision_init_val", None)
+    initial_value = get_high_precision_init_val() if get_high_precision_init_val else None
     reference_main_weight = torch.nn.Parameter(
-        linear.weight.get_high_precision_init_val().to(
+        (initial_value if initial_value is not None else linear.weight).to(
             device=distributed_setup.device, dtype=torch.float32
         )
     )
