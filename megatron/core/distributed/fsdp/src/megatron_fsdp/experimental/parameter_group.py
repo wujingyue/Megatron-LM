@@ -189,14 +189,32 @@ class FsdpParameterGroup:
         else:
             self._symm_mem_pool = None
 
-        if self.dtype == torch.uint8:
-            self.model_weight = GroupedDBuffer(
-                self.mesh,
-                model_weight_placements,
-                tensor_shapes,
-                self.main_weight.device,
-                block_size=block_size,
-            )
+        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
+            self.model_weight = self.main_weight
+        else:
+            with self._symmetric_memory_context():
+                if self.dtype == torch.uint8:
+                    self.model_weight = GroupedDBuffer(
+                        self.mesh,
+                        model_weight_placements,
+                        tensor_shapes,
+                        self.main_weight.device,
+                        block_size=block_size,
+                    )
+                else:
+                    # Keep the configured compute-weight layout alive for the lifetime of this
+                    # parameter group. The optimizer-layout sync buffer below is only a view
+                    # into its local storage, so the first ZeRO-1 unshard can all-gather
+                    # directly into this allocation.
+                    self.model_weight = DBuffer(
+                        mesh=self.mesh,
+                        placements=model_weight_placements,
+                        tensor_shapes=tensor_shapes,
+                        dtype=self.dtype,
+                        device=self.main_weight.device,
+                        block_size=block_size,
+                    )
+        if isinstance(self.model_weight, GroupedDBuffer):
             self.model_weight.sync_from_main(self.main_weight)
             self._unsharded_model_weight = GroupedDBuffer(
                 self.mesh,
@@ -207,23 +225,7 @@ class FsdpParameterGroup:
             )
             self.post_optimizer_model_weight = self.model_weight
             self._model_weight_is_stale = False
-        elif main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
-            self.model_weight = self.main_weight
         else:
-            # Keep the configured compute-weight layout alive for the lifetime of this
-            # parameter group. The optimizer-layout sync buffer below is only a view
-            # into its local storage, so the first ZeRO-1 unshard can all-gather
-            # directly into this allocation.
-            with self._symmetric_memory_context():
-                self.model_weight = DBuffer(
-                    mesh=self.mesh,
-                    placements=model_weight_placements,
-                    tensor_shapes=tensor_shapes,
-                    dtype=self.dtype,
-                    device=self.main_weight.device,
-                    block_size=block_size,
-                )
-        if self.dtype != torch.uint8:
             assert isinstance(self.model_weight, DBuffer)
             self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
             # Cast into the preallocated optimizer-layout view on the current stream.
