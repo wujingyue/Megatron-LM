@@ -39,7 +39,7 @@ def test_grouped_dbuffer_allgathers_every_plane(distributed_setup):
 
     result = grouped.allgather(0)
 
-    assert result.placements == (Replicate(),)
+    assert result.rowwise_data.placements == (Replicate(),)
     for plane in result.planes:
         assert plane.local_buffer.view(mesh.size(), -1)[0].eq(0).all()
         assert plane.local_buffer.view(mesh.size(), -1)[1].eq(1).all()

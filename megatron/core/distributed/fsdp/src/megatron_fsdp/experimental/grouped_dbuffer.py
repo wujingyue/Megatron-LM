@@ -15,7 +15,6 @@
 """Transformer Engine MXFP8 distributed buffers composed from physical planes."""
 
 from collections.abc import Iterable
-from typing import Self
 
 import torch
 from torch.distributed import DeviceMesh
@@ -31,17 +30,9 @@ if not HAVE_TE_MXFP8TENSOR:
 import transformer_engine_torch as tex
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 
-_MXFP8_BLOCK_SIZE = 32
-_MXFP8_ROWWISE_SCALE_ALIGNMENT = 128
-_MXFP8_COLUMNWISE_SCALE_ALIGNMENT = 128
-_MXFP8_SCALE_ROW_ALIGNMENT = 4
 _PLANE_NAMES = ("rowwise_data", "columnwise_data", "rowwise_scale", "columnwise_scale")
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
 _MXFP8_QUANTIZER = MXFP8Quantizer(_MXFP8_DTYPE)
-
-
-def _round_up(value: int, multiple: int) -> int:
-    return (value + multiple - 1) // multiple * multiple
 
 
 def is_mxfp8_tensor(tensor: torch.Tensor) -> bool:
@@ -56,12 +47,10 @@ def is_mxfp8_tensor(tensor: torch.Tensor) -> bool:
 class GroupedDBuffer:
     """The MFSDP storage and lifecycle for one TE MXFP8 tensor.
 
-    The data and scale planes can have different dtypes, logical shapes, and
-    layouts, but share mesh and placement state.
+    The physical planes have different logical shapes and placements but share
+    one device mesh.
     """
 
-    mesh: DeviceMesh
-    placements: tuple[Placement, ...]
     rowwise_data: DBuffer
     columnwise_data: DBuffer
     rowwise_scale: DBuffer
@@ -90,12 +79,7 @@ class GroupedDBuffer:
             mesh,
             placements,
             (
-                torch.Size(
-                    (
-                        _round_up(shape[0], _MXFP8_ROWWISE_SCALE_ALIGNMENT),
-                        _round_up(shape[1] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT),
-                    )
-                )
+                torch.Size(_MXFP8_QUANTIZER.get_scale_shape(shape, columnwise=False))
                 for shape in tensor_shapes
             ),
             torch.uint8,
@@ -106,19 +90,17 @@ class GroupedDBuffer:
             mesh,
             self._plane_placements("columnwise_scale", placements),
             (
-                torch.Size(
-                    (
-                        _round_up(shape[0] // _MXFP8_BLOCK_SIZE, _MXFP8_SCALE_ROW_ALIGNMENT),
-                        _round_up(shape[1], _MXFP8_COLUMNWISE_SCALE_ALIGNMENT),
-                    )
-                )
+                torch.Size(_MXFP8_QUANTIZER.get_scale_shape(shape, columnwise=True))
                 for shape in tensor_shapes
             ),
             torch.uint8,
             device,
         )
-        self.mesh = mesh
-        self.placements = placements
+
+    @property
+    def mesh(self) -> DeviceMesh:
+        """Device mesh shared by all physical planes."""
+        return self.rowwise_data.mesh
 
     @classmethod
     def _from_planes(
@@ -127,15 +109,13 @@ class GroupedDBuffer:
         columnwise_data: DBuffer,
         rowwise_scale: DBuffer,
         columnwise_scale: DBuffer,
-    ) -> Self:
+    ) -> "GroupedDBuffer":
         """Create a composed view from already-allocated physical planes."""
         result = cls.__new__(cls)
         result.rowwise_data = rowwise_data
         result.columnwise_data = columnwise_data
         result.rowwise_scale = rowwise_scale
         result.columnwise_scale = columnwise_scale
-        result.mesh = rowwise_data.mesh
-        result.placements = rowwise_data.placements
         return result
 
     @staticmethod
@@ -182,7 +162,9 @@ class GroupedDBuffer:
         """Whether every plane is backed by symmetric memory."""
         return all(plane.is_symmetric_memory for plane in self.planes)
 
-    def _result(self, planes: tuple[DBuffer, DBuffer, DBuffer, DBuffer], out: Self | None) -> Self:
+    def _result(
+        self, planes: tuple[DBuffer, DBuffer, DBuffer, DBuffer], out: "GroupedDBuffer | None"
+    ) -> "GroupedDBuffer":
         """Return constructed plane results or preserve a supplied destination."""
         if out is None:
             return type(self)._from_planes(*planes)
@@ -199,7 +181,7 @@ class GroupedDBuffer:
         for plane in self.planes:
             plane.release_storage()
 
-    def view(self, placements: Iterable[Placement]) -> Self:
+    def view(self, placements: Iterable[Placement]) -> "GroupedDBuffer":
         """Return a storage-sharing view of every physical plane."""
         return type(self)._from_planes(
             *(
@@ -208,15 +190,18 @@ class GroupedDBuffer:
             )
         )
 
-    def redistribute(self, new_placements: Iterable[Placement], *, out: Self | None = None) -> Self:
+    def redistribute(
+        self, new_placements: Iterable[Placement], *, out: "GroupedDBuffer | None" = None
+    ) -> "GroupedDBuffer":
         """Redistribute every plane with the same placement transition."""
         new_placements = tuple(new_placements)
         if out is not None:
             if out.mesh != self.mesh:
                 raise ValueError(f"Expected out mesh {self.mesh!r}, got {out.mesh!r}.")
-            if out.placements != new_placements:
+            if out.rowwise_data.placements != new_placements:
                 raise ValueError(
-                    f"Expected out placements {new_placements!r}, got {out.placements!r}."
+                    "Expected out rowwise-data placements "
+                    f"{new_placements!r}, got {out.rowwise_data.placements!r}."
                 )
         result_planes = tuple(
             plane.redistribute(
@@ -227,7 +212,7 @@ class GroupedDBuffer:
         )
         return self._result(result_planes, out)
 
-    def allgather(self, mesh_axis: int, *, out: Self | None = None) -> Self:
+    def allgather(self, mesh_axis: int, *, out: "GroupedDBuffer | None" = None) -> "GroupedDBuffer":
         """All-gather every materialized physical plane on ``mesh_axis``."""
         result_planes = tuple(
             plane.allgather(mesh_axis, out=None if out is None else out.planes[index])
