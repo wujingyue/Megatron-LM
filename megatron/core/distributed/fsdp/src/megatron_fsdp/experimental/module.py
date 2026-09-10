@@ -28,7 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
-from .grouped_dbuffer import is_mxfp8_tensor
+from .grouped_dbuffer import effective_dtype
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
@@ -201,7 +201,7 @@ class FsdpModule:
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             first_parameter = next(iter(group_parameters.values()))
-            group_dtype = torch.uint8 if is_mxfp8_tensor(first_parameter) else first_parameter.dtype
+            group_dtype = effective_dtype(first_parameter)
             parameter_groups.append(
                 FsdpParameterGroup(
                     owning_module=self,
@@ -605,11 +605,7 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
     grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        # MXFP8 presents its nominal compute dtype (normally BF16), but MFSDP stores
-        # its physical planes as uint8. Group by that storage dtype to keep the two
-        # representations separate without a second MXFP8 discriminator.
-        group_dtype = torch.uint8 if is_mxfp8_tensor(parameter) else parameter.dtype
-        key = (group_dtype, parameter.requires_grad)
+        key = (effective_dtype(parameter), parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 

@@ -43,6 +43,11 @@ def is_mxfp8_tensor(tensor: torch.Tensor) -> bool:
     )
 
 
+def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
+    """Return MFSDP's storage dtype for a parameter."""
+    return torch.uint8 if is_mxfp8_tensor(tensor) else tensor.dtype
+
+
 class GroupedDBuffer:
     """The MFSDP storage and lifecycle for one TE MXFP8 tensor.
 

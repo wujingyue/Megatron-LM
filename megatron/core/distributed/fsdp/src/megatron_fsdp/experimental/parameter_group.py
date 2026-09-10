@@ -29,7 +29,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .grouped_dbuffer import GroupedDBuffer, is_mxfp8_tensor
+from .grouped_dbuffer import GroupedDBuffer, effective_dtype
 from .module_utils import get_parameter_owner
 from .placement import BlockAtomic
 
@@ -168,23 +168,19 @@ class FsdpParameterGroup:
         self.mesh = mesh
         self.grad_divisor = grad_divisor
         first_parameter = next(iter(parameter_to_fqns))
-        is_mxfp8 = is_mxfp8_tensor(first_parameter)
-        self.dtype = first_parameter.dtype
+        self.dtype = effective_dtype(first_parameter)
         self.requires_grad = first_parameter.requires_grad
         for parameter, fqns in parameter_to_fqns.items():
-            if parameter.dtype != self.dtype:
+            if effective_dtype(parameter) != self.dtype:
                 raise ValueError(
                     f"Expected parameter {fqns!r} to have dtype {self.dtype}, "
-                    f"got {parameter.dtype}."
+                    f"got {effective_dtype(parameter)}."
                 )
             if parameter.requires_grad != self.requires_grad:
                 raise ValueError(
                     f"Expected parameter {fqns!r} to have requires_grad={self.requires_grad}, "
                     f"got {parameter.requires_grad}."
                 )
-            if is_mxfp8_tensor(parameter) != is_mxfp8:
-                raise TypeError("FSDP parameter groups cannot mix MXFP8 and non-MXFP8 tensors.")
-
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         block_size = 1
         for placements in (model_weight_placements, main_grad_placements, main_weight_placements):
@@ -193,7 +189,9 @@ class FsdpParameterGroup:
                     block_size = math.lcm(block_size, placement.block_size)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
-        high_precision_init_values = _mxfp8_initial_values(parameter_to_fqns) if is_mxfp8 else None
+        high_precision_init_values = (
+            _mxfp8_initial_values(parameter_to_fqns) if self.dtype == torch.uint8 else None
+        )
 
         if high_precision_init_values is not None:
             self.main_weight = DBuffer.distribute_tensors(
@@ -207,7 +205,7 @@ class FsdpParameterGroup:
             )
             for parameter in parameter_to_fqns:
                 parameter.clear_high_precision_init_val()
-        elif is_mxfp8:
+        elif self.dtype == torch.uint8:
             # Checkpoint restore will populate main_weight and then regenerate the MXFP8 planes.
             self.main_weight = DBuffer(
                 mesh=self.mesh,
@@ -232,7 +230,7 @@ class FsdpParameterGroup:
         else:
             self._symm_mem_pool = None
 
-        if is_mxfp8:
+        if self.dtype == torch.uint8:
             self.model_weight = GroupedDBuffer(
                 self.mesh,
                 model_weight_placements,
@@ -267,7 +265,7 @@ class FsdpParameterGroup:
                     device=self.main_weight.device,
                     block_size=block_size,
                 )
-        if not is_mxfp8:
+        if self.dtype != torch.uint8:
             assert isinstance(self.model_weight, DBuffer)
             self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
             # Cast into the preallocated optimizer-layout view on the current stream.
@@ -290,7 +288,7 @@ class FsdpParameterGroup:
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
         if self.requires_grad:
-            grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
+            grad_dtype = mixed_precision_policy.main_grads_dtype or first_parameter.dtype
             # Keep main_grad persistent for the initial implementation. For micro-batch
             # size 1, this allocation could be delayed until post_backward and then
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
