@@ -167,21 +167,18 @@ class GroupedDBuffer:
             Flat() if isinstance(placement, BlockAtomic) else placement for placement in placements
         )
 
-    def _get_local_tensor(self, index: int, *, pad_scales: bool) -> torch.Tensor:
+    def get_local_tensor(self, index: int) -> torch.Tensor:
         """Construct a TE MXFP8 wrapper from this rank's physical-plane views."""
         rowwise_data = self.rowwise_data.get_local_tensor(index)
         rowwise_scale = self.rowwise_scale.get_local_tensor(index)
         columnwise_scale = self.columnwise_scale.get_local_tensor(index)
-        if pad_scales:
-            rowwise_scale = self._pad_scale(rowwise_scale, rowwise=True)
-            columnwise_scale = self._pad_scale(columnwise_scale, rowwise=False)
         return MXFP8Tensor(
             shape=rowwise_data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
-            rowwise_scale_inv=rowwise_scale,
+            rowwise_scale_inv=self._pad_scale(rowwise_scale, rowwise=True),
             columnwise_data=self.columnwise_data.get_local_tensor(index),
-            columnwise_scale_inv=columnwise_scale,
+            columnwise_scale_inv=self._pad_scale(columnwise_scale, rowwise=False),
             fp8_dtype=_MXFP8_DTYPE,
             quantizer=_MXFP8_QUANTIZER,
             with_gemm_swizzled_scales=False,
@@ -205,16 +202,24 @@ class GroupedDBuffer:
         padded[: scale.shape[0], : scale.shape[1]].copy_(scale)
         return padded
 
-    def get_local_tensor(self, index: int) -> torch.Tensor:
-        """Construct a compute-ready TE MXFP8 wrapper for this rank's local data."""
-        return self._get_local_tensor(index, pad_scales=True)
-
     def sync_from_main(self, main_weight: DBuffer) -> None:
         """Quantize the local FP32 master shard into MXFP8 grouped planes."""
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
-            tensor = self._get_local_tensor(index, pad_scales=False)
+            tensor = self.get_local_tensor(index)
+            rowwise_scale = self.rowwise_scale.get_local_tensor(index)
+            columnwise_scale = self.columnwise_scale.get_local_tensor(index)
             with torch.no_grad():
                 tensor.quantize_(main_weight.get_local_tensor(index))
+                assert tensor._rowwise_scale_inv is not None
+                assert tensor._columnwise_scale_inv is not None
+                rowwise_scale.copy_(
+                    tensor._rowwise_scale_inv[: rowwise_scale.shape[0], : rowwise_scale.shape[1]]
+                )
+                columnwise_scale.copy_(
+                    tensor._columnwise_scale_inv[
+                        : columnwise_scale.shape[0], : columnwise_scale.shape[1]
+                    ]
+                )
 
     @property
     def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:
