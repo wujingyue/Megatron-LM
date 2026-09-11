@@ -22,6 +22,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import HAVE_TE_MXFP8TENSOR
 from .dbuffer import DBuffer
+from .layout import GlobalLayout
 from .placement import BlockAtomic, Flat
 
 if not HAVE_TE_MXFP8TENSOR:
@@ -32,6 +33,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8
 
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
 _MXFP8_QUANTIZER = MXFP8Quantizer(_MXFP8_DTYPE)
+_MXFP8_BLOCK_SIZE = 32
 
 
 def is_mxfp8_tensor(tensor: torch.Tensor) -> bool:
@@ -51,8 +53,10 @@ def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
 class GroupedDBuffer:
     """The MFSDP storage and lifecycle for one TE MXFP8 tensor.
 
-    The physical planes have different logical shapes and placements but share
-    one device mesh.
+    The data layout owns the parameter-to-rank partition. Scale planes use its
+    compact MXFP8 coordinates, so every plane on a rank describes the same
+    local data rows. TE-only padding is added when materializing a wrapper for
+    compute, not to distributed storage.
     """
 
     rowwise_data: DBuffer
@@ -72,33 +76,57 @@ class GroupedDBuffer:
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
         if not tensor_shapes or any(len(shape) != 2 for shape in tensor_shapes):
             raise ValueError("GroupedDBuffer requires one or more 2D MXFP8 tensor shapes.")
+        if any(
+            shape[0] % _MXFP8_BLOCK_SIZE or shape[1] % _MXFP8_BLOCK_SIZE for shape in tensor_shapes
+        ):
+            raise ValueError(
+                f"GroupedDBuffer requires dimensions divisible by {_MXFP8_BLOCK_SIZE}."
+            )
         placements = tuple(placements)
         self.rowwise_data = DBuffer(
             mesh, placements, tensor_shapes, torch.uint8, device, block_size=block_size
         )
-        self.columnwise_data = DBuffer(
-            mesh, placements, tensor_shapes, torch.uint8, device, block_size=block_size
-        )
-        self.rowwise_scale = DBuffer(
-            mesh,
-            placements,
-            (
-                torch.Size(_MXFP8_QUANTIZER.get_scale_shape(shape, columnwise=False))
-                for shape in tensor_shapes
-            ),
-            torch.uint8,
-            device,
-            block_size=block_size,
-        )
-        self.columnwise_scale = DBuffer(
+        self.columnwise_data = self._plane(mesh, placements, self.rowwise_data.layout, device)
+        self.rowwise_scale = self._plane(mesh, placements, self._scale_layout(rowwise=True), device)
+        self.columnwise_scale = self._plane(
             mesh,
             self._columnwise_scale_placements(placements),
-            (
-                torch.Size(_MXFP8_QUANTIZER.get_scale_shape(shape, columnwise=True))
-                for shape in tensor_shapes
-            ),
-            torch.uint8,
+            self._scale_layout(rowwise=False),
             device,
+        )
+
+    def _scale_layout(self, *, rowwise: bool) -> GlobalLayout:
+        """Derive a compact scale layout from the data layout's coordinates."""
+        data_layout = self.rowwise_data.layout
+        tensor_shapes = tuple(
+            torch.Size(
+                (shape[0], shape[1] // _MXFP8_BLOCK_SIZE)
+                if rowwise
+                else (shape[0] // _MXFP8_BLOCK_SIZE, shape[1])
+            )
+            for shape in data_layout.tensor_shapes
+        )
+        return GlobalLayout(
+            tensor_shapes=tensor_shapes,
+            tensor_to_offset=tuple(
+                offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
+            ),
+            size=data_layout.size // _MXFP8_BLOCK_SIZE,
+            block_size=data_layout.block_size if rowwise else 1,
+        )
+
+    @staticmethod
+    def _plane(
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        layout: GlobalLayout,
+        device: torch.device | str,
+    ) -> DBuffer:
+        """Allocate one physical plane from a GroupedDBuffer-owned layout."""
+        placements = tuple(placements)
+        _, local_numel = layout.get_local_range(mesh, placements)
+        return DBuffer.from_local(
+            torch.empty(local_numel, dtype=torch.uint8, device=device), mesh, placements, layout
         )
 
     @property
@@ -139,16 +167,21 @@ class GroupedDBuffer:
             Flat() if isinstance(placement, BlockAtomic) else placement for placement in placements
         )
 
-    def get_local_tensor(self, index: int) -> torch.Tensor:
-        """Construct a TE MXFP8 wrapper from this rank's four physical-plane views."""
+    def _get_local_tensor(self, index: int, *, pad_scales: bool) -> torch.Tensor:
+        """Construct a TE MXFP8 wrapper from this rank's physical-plane views."""
         rowwise_data = self.rowwise_data.get_local_tensor(index)
+        rowwise_scale = self.rowwise_scale.get_local_tensor(index)
+        columnwise_scale = self.columnwise_scale.get_local_tensor(index)
+        if pad_scales:
+            rowwise_scale = self._pad_scale(rowwise_scale, rowwise=True)
+            columnwise_scale = self._pad_scale(columnwise_scale, rowwise=False)
         return MXFP8Tensor(
             shape=rowwise_data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
-            rowwise_scale_inv=self.rowwise_scale.get_local_tensor(index),
+            rowwise_scale_inv=rowwise_scale,
             columnwise_data=self.columnwise_data.get_local_tensor(index),
-            columnwise_scale_inv=self.columnwise_scale.get_local_tensor(index),
+            columnwise_scale_inv=columnwise_scale,
             fp8_dtype=_MXFP8_DTYPE,
             quantizer=_MXFP8_QUANTIZER,
             with_gemm_swizzled_scales=False,
@@ -156,10 +189,30 @@ class GroupedDBuffer:
             requires_grad=False,
         )
 
+    @staticmethod
+    def _pad_scale(scale: torch.Tensor, *, rowwise: bool) -> torch.Tensor:
+        """Pad a compact scale plane to TE's GEMM allocation requirements."""
+        padded_shape = _MXFP8_QUANTIZER.get_scale_shape(
+            (
+                scale.shape[0] if rowwise else scale.shape[0] * _MXFP8_BLOCK_SIZE,
+                scale.shape[1] * _MXFP8_BLOCK_SIZE if rowwise else scale.shape[1],
+            ),
+            columnwise=not rowwise,
+        )
+        if scale.shape == padded_shape:
+            return scale
+        padded = torch.zeros(padded_shape, dtype=scale.dtype, device=scale.device)
+        padded[: scale.shape[0], : scale.shape[1]].copy_(scale)
+        return padded
+
+    def get_local_tensor(self, index: int) -> torch.Tensor:
+        """Construct a compute-ready TE MXFP8 wrapper for this rank's local data."""
+        return self._get_local_tensor(index, pad_scales=True)
+
     def sync_from_main(self, main_weight: DBuffer) -> None:
         """Quantize the local FP32 master shard into MXFP8 grouped planes."""
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
-            tensor = self.get_local_tensor(index)
+            tensor = self._get_local_tensor(index, pad_scales=False)
             with torch.no_grad():
                 tensor.quantize_(main_weight.get_local_tensor(index))
 

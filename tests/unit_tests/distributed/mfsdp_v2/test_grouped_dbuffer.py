@@ -62,6 +62,28 @@ def test_grouped_dbuffer_redistributes_into_matching_destinations(distributed_se
         )
 
 
+def test_grouped_dbuffer_derives_scale_shards_from_data(distributed_setup):
+    """Scale planes own exactly the blocks represented by their local data views."""
+    if distributed_setup.world_size != 2:
+        pytest.skip("GroupedDBuffer layout coverage requires exactly two ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    grouped = GroupedDBuffer(
+        mesh, [BlockAtomic(32)], [(128, 64), (32, 64)], distributed_setup.device, block_size=32
+    )
+
+    for index in range(2):
+        data = grouped.rowwise_data.get_local_tensor(index)
+        assert grouped.rowwise_scale.get_local_tensor(index).shape == (
+            data.shape[0],
+            data.shape[1] // 32,
+        )
+        assert grouped.columnwise_scale.get_local_tensor(index).shape == (
+            data.shape[0] // 32,
+            data.shape[1],
+        )
+
+
 @pytest.mark.parametrize("preserve_high_precision_init_val", [True, False])
 @pytest.mark.parametrize("parameter_placement", [Shard(0), Replicate()])
 def test_mxfp8_linear_training_step_uses_grouped_dbuffer(
@@ -163,7 +185,7 @@ def test_mxfp8_grouped_dbuffer_handles_multiple_weights_and_biases(distributed_s
                 64, 128, bias=True, params_dtype=torch.bfloat16, device=distributed_setup.device
             ),
             te.pytorch.Linear(
-                128, 64, bias=True, params_dtype=torch.bfloat16, device=distributed_setup.device
+                128, 32, bias=True, params_dtype=torch.bfloat16, device=distributed_setup.device
             ),
         )
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -185,7 +207,7 @@ def test_mxfp8_grouped_dbuffer_handles_multiple_weights_and_biases(distributed_s
     grouped_parameter_group = grouped_parameter_groups[0]
     assert grouped_parameter_group.model_weight.rowwise_data.layout.tensor_shapes == (
         torch.Size((128, 64)),
-        torch.Size((64, 128)),
+        torch.Size((32, 128)),
     )
     assert len(grouped_parameter_group.fsdp_parameters) == 2
     assert (
