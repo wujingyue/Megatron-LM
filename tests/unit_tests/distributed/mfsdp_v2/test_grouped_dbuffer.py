@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard
+from transformer_engine.pytorch.optimizers import FusedAdam
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
@@ -112,9 +113,9 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(
     ) is isinstance(parameter_placement, Shard)
     assert parameter_group.main_weight.placements == (BlockAtomic(32),)
 
-    optimizer = torch.optim.SGD(linear.parameters(), lr=0.1)
+    optimizer = FusedAdam(linear.parameters(), lr=0.1)
     fully_shard_optimizer(optimizer)
-    reference_optimizer = torch.optim.SGD([reference_main_weight], lr=0.1)
+    reference_optimizer = FusedAdam([reference_main_weight], lr=0.1)
 
     torch.manual_seed(1234)
     x = torch.randn(32, 64, dtype=torch.bfloat16, device=distributed_setup.device)
@@ -145,3 +146,61 @@ def test_mxfp8_linear_training_step_uses_grouped_dbuffer(
     assert torch.isfinite(loss)
     with torch.no_grad(), te.pytorch.autocast(recipe=recipe):
         assert torch.isfinite(linear(x)).all()
+
+
+def test_mxfp8_grouped_dbuffer_handles_multiple_weights_and_biases(distributed_setup):
+    """Two MXFP8 weights share one group while BF16 biases form another."""
+    te = pytest.importorskip("transformer_engine")
+    if distributed_setup.world_size != 2:
+        pytest.skip("MXFP8 grouped DBuffer coverage requires exactly two ranks.")
+    if torch.cuda.get_device_capability(distributed_setup.device)[0] < 10:
+        pytest.skip("MXFP8 requires Blackwell-or-newer CUDA hardware.")
+
+    recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=te.common.recipe.Format.HYBRID)
+    with te.pytorch.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        model = torch.nn.Sequential(
+            te.pytorch.Linear(
+                64, 128, bias=True, params_dtype=torch.bfloat16, device=distributed_setup.device
+            ),
+            te.pytorch.Linear(
+                128, 64, bias=True, params_dtype=torch.bfloat16, device=distributed_setup.device
+            ),
+        )
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    placements = Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=placements,
+            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+        )
+
+    grouped_parameter_groups = [
+        group for group in model.parameter_groups if isinstance(group.model_weight, GroupedDBuffer)
+    ]
+    assert len(grouped_parameter_groups) == 1
+    grouped_parameter_group = grouped_parameter_groups[0]
+    assert grouped_parameter_group.model_weight.rowwise_data.layout.tensor_shapes == (
+        torch.Size((128, 64)),
+        torch.Size((64, 128)),
+    )
+    assert len(grouped_parameter_group.fsdp_parameters) == 2
+    assert (
+        grouped_parameter_group.post_optimizer_model_weight
+        is not grouped_parameter_group.model_weight
+    )
+    assert len(model.parameter_groups) == 2
+
+    optimizer = FusedAdam(model.parameters(), lr=0.1)
+    fully_shard_optimizer(optimizer)
+    x = torch.randn(32, 64, dtype=torch.bfloat16, device=distributed_setup.device)
+    optimizer.zero_grad(set_to_none=True)
+    with te.pytorch.autocast(recipe=recipe):
+        loss = model(x).float().square().mean()
+    loss.backward()
+    optimizer.step()
+    with torch.no_grad(), te.pytorch.autocast(recipe=recipe):
+        assert torch.isfinite(model(x)).all()

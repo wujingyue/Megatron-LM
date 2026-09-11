@@ -106,6 +106,11 @@ class GroupedDBuffer:
         """Device mesh shared by all physical planes."""
         return self.rowwise_data.mesh
 
+    @property
+    def placements(self) -> tuple[Placement, ...]:
+        """Logical weight placements shared by the data planes."""
+        return self.rowwise_data.placements
+
     @classmethod
     def _from_planes(
         cls,

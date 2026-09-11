@@ -317,62 +317,42 @@ class FsdpParameterGroup:
         """Refresh compute weights from optimizer weights."""
         if isinstance(self.post_optimizer_model_weight, GroupedDBuffer):
             self.post_optimizer_model_weight.sync_from_main(self.main_weight)
-            self._model_weight_is_stale = (
-                self.post_optimizer_model_weight.rowwise_data.placements
-                != self.model_weight.rowwise_data.placements
-            )
-            return
-        assert isinstance(self.model_weight, DBuffer)
-        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        else:
+            assert isinstance(self.model_weight, DBuffer)
+            self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
-        if isinstance(self.model_weight, GroupedDBuffer):
-            assert isinstance(self._unsharded_model_weight, GroupedDBuffer)
-            assert isinstance(self.post_optimizer_model_weight, GroupedDBuffer)
-            if self._model_weight_is_stale:
-                self.post_optimizer_model_weight.redistribute(
-                    self.model_weight.rowwise_data.placements, out=self.model_weight
-                )
-                self._model_weight_is_stale = False
-            self._unsharded_model_weight.reallocate_storage()
-            preserved_tensors = tuple(
-                plane.local_buffer for plane in self._unsharded_model_weight.planes
-            )
-            with torch.autograd._unsafe_preserve_version_counter(preserved_tensors):
-                self.model_weight.redistribute(
-                    [Replicate()] * self.mesh.ndim, out=self._unsharded_model_weight
-                )
-            self._switch_to_unsharded_parameters()
-            return
-        assert isinstance(self.model_weight, DBuffer)
-        assert isinstance(self.post_optimizer_model_weight, DBuffer)
-        assert isinstance(self._unsharded_model_weight, DBuffer)
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
             )
             self._model_weight_is_stale = False
-        if self.model_weight.placements == self._unsharded_model_weight.placements:
-            unsharded_model_weight = self.model_weight
-        else:
+
+        unsharded_model_weight = self._unsharded_model_weight
+        if self.model_weight.placements != unsharded_model_weight.placements:
             with self._symmetric_memory_context():
-                self._unsharded_model_weight.reallocate_storage()
+                unsharded_model_weight.reallocate_storage()
+            preserved_tensors = (
+                tuple(plane.local_buffer for plane in unsharded_model_weight.planes)
+                if isinstance(unsharded_model_weight, GroupedDBuffer)
+                else unsharded_model_weight.local_buffer
+            )
             # This buffer backs unsharded Parameters whose views may be saved by autograd.
             # Autograd records a tensor's version counter when saving it for backward, and
             # in-place writes like the out= redistribution below increment that counter even
             # under no_grad. Without preserving it, backward can fail with "modified by an
             # inplace operation" even though FSDP only materialized internal storage.
-            with torch.autograd._unsafe_preserve_version_counter(
-                self._unsharded_model_weight.local_buffer
-            ):
+            with torch.autograd._unsafe_preserve_version_counter(preserved_tensors):
                 self.model_weight.redistribute(
-                    self._unsharded_model_weight.placements, out=self._unsharded_model_weight
+                    unsharded_model_weight.placements, out=unsharded_model_weight
                 )
-            unsharded_model_weight = self._unsharded_model_weight
+        else:
+            unsharded_model_weight = self.model_weight
+
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             fsdp_parameter.unsharded.data = unsharded_model_weight.get_local_tensor(index)
         self._switch_to_unsharded_parameters()
