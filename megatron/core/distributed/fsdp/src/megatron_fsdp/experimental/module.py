@@ -29,7 +29,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
-from .module_utils import get_parameter_owner
+from .module_utils import count_used_parameters, get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
@@ -337,7 +337,10 @@ class FsdpModule:
             lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
         )
         module.register_forward_hook(
-            lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
+            lambda hooked_module, args, kwargs, output: cast(
+                FsdpModule, hooked_module
+            ).post_forward(output, inputs=(args, kwargs)),
+            with_kwargs=True,
         )
         module.register_full_backward_pre_hook(
             lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
@@ -506,8 +509,25 @@ class FsdpModule:
                 group.unshard_parameters()
             self._unshard_event = allgather_stream.record_event()
 
-    def post_forward(self) -> None:
+    def post_forward(self, output: object = None, *, inputs: object = ()) -> None:
         """Return parameters to their sharded resting state after forward compute."""
+        if (
+            output is not None
+            and torch.is_grad_enabled()
+            and self.phase is not FsdpModule.Phase.BACKWARD
+        ):
+            self._trainable_parameter_countdown = Countdown(
+                count_used_parameters(
+                    output,
+                    (
+                        parameter.unsharded
+                        for group in self._parameter_groups
+                        if group.requires_grad
+                        for parameter in group.fsdp_parameters
+                    ),
+                    inputs,
+                )
+            )
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after weight consumption.
@@ -562,6 +582,8 @@ class FsdpModule:
             context.reduce_scatter_stream.wait_stream(current_stream)
 
         self.unshard(prefetch="backward")
+        if self._trainable_parameter_countdown.initial_value == 0:
+            self.post_accumulate_grad()
 
     def post_backward(self) -> None:
         """Finish this module's backward and release weights when safe."""
