@@ -389,6 +389,20 @@ def apply_rotary_pos_emb(
                     "Using unfused implementation."
                 )
                 use_unfused = True
+            # Packed vision images carry one frequency row per token. The THD
+            # kernel restarts indexing for each image, which assumes a shared
+            # position table. Apply these token-aligned angles as one sequence.
+            if (
+                not use_unfused
+                and max_seqlen is not None
+                and freqs.size(0) > max_seqlen
+                and cp_group.size() == 1
+                and freqs.size(0) == t.size(0)
+            ):
+                assert fused_apply_rotary_pos_emb is not None
+                return fused_apply_rotary_pos_emb(
+                    t.unsqueeze(1), freqs, interleaved=config.rotary_interleaved
+                ).squeeze(1)
             if not use_unfused:
                 assert (
                     fused_apply_rotary_pos_emb_thd is not None
