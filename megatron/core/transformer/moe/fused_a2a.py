@@ -630,6 +630,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        max_num_tokens=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -651,6 +652,8 @@ class HybridEPDispatch(torch.autograd.Function):
 
         if _hybrid_ep_buffer is None:
             num_tokens, hidden_dim = x.shape[-2:]
+            if max_num_tokens is not None:
+                num_tokens = max(num_tokens, max_num_tokens)
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
@@ -735,6 +738,7 @@ class HybridEPDispatch(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -797,6 +801,7 @@ if HAVE_HYBRIDEP:
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        max_num_tokens=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -834,6 +839,8 @@ if HAVE_HYBRIDEP:
                 Dense top-k expert indices with shape [num_tokens, topk].
             num_of_experts (int, optional):
                 Total number of experts. Required when topk_idx is provided.
+            max_num_tokens (int, optional):
+                Minimum token capacity reserved when the buffer is first allocated.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -851,6 +858,7 @@ if HAVE_HYBRIDEP:
             num_sms_preprocessing_api,
             topk_idx,
             num_of_experts,
+            max_num_tokens,
         )
 
     @internal_api

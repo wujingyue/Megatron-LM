@@ -1268,6 +1268,7 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
                 topk_idx=self.topk_idx,
                 num_of_experts=self.num_experts,
+                max_num_tokens=self.config.moe_hybridep_max_num_tokens_per_rank,
             )
         )
         if has_rank_capacity:
