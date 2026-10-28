@@ -1,4 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# MTP main-token normalization adapted from NVIDIA-NeMo/nv-mistralai-megatron,
+# revision 3ffc55243c888171e13022fc3b35c4ed9a342012, BSD-3-Clause (see LICENSE):
+# https://github.com/NVIDIA-NeMo/nv-mistralai-megatron/tree/3ffc55243c888171e13022fc3b35c4ed9a342012
 
 import logging
 import math
@@ -77,6 +80,11 @@ class TransformerConfig(ModelParallelConfig):
     MTP extends the prediction scope to multiple future tokens at each position.
     This MTP implementation sequentially predict additional tokens
     by using D sequential modules to predict D additional tokens.
+    """
+
+    mtp_normalize_loss_by_main_tokens: bool = False
+    """Keep MTP losses as sums for final normalization by the global main-token count.
+    Requires calculate_per_token_loss. Disabled by default to retain the upstream objective.
     """
 
     mtp_loss_scaling_factor: Optional[float] = 0.1
@@ -1750,6 +1758,10 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.mtp_normalize_loss_by_main_tokens and not self.calculate_per_token_loss:
+            raise ValueError(
+                "mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True."
+            )
         self._validate_cp_layouts()
 
         if self.attn_logit_softcapping is not None and not (
