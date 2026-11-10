@@ -23,13 +23,16 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
@@ -54,6 +57,89 @@ def process_group_collection(distributed_setup):
     model_parallel_cuda_manual_seed(1234)
     yield process_group_collection
     destroy_model_parallel()
+
+
+def test_residual_recompute_matches_eager_training(process_group_collection, distributed_setup):
+    """Per-layer residual replay must use weights gathered by the owning FSDP unit."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        gradient_accumulation_fusion=False,
+        use_cpu_initialization=True,
+        wide_residual=WideResidualConfig(num_streams=3, streamwise_sigmoid_init_scale=0.01),
+    )
+    replay_config = replace(
+        config,
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=1,
+    )
+    submodules = HybridStackSubmodules(
+        attention_layer=replace(get_gpt_layer_local_spec(), module=WideResidualTransformerLayer)
+    )
+    torch.manual_seed(1234)
+    reference, replay = [
+        HybridStack(
+            model_config,
+            submodules,
+            layer_type_list=[Symbols.ATTENTION] * config.num_layers,
+            post_layer_norm=False,
+            pg_collection=process_group_collection,
+        ).cuda()
+        for model_config in (config, replay_config)
+    ]
+    replay.load_state_dict(reference.state_dict())
+    replay = FullyShardedDataParallel(
+        config=replay_config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            # Gather on demand so prefetch cannot hide replay before its owner.
+            suggested_communication_unit_size=0,
+        ),
+        module=replay,
+        pg_collection=process_group_collection,
+    )
+    assert all(isinstance(layer, FsdpModule) for layer in replay.module.layers)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    replay_optimizer = get_megatron_optimizer(
+        OptimizerConfig(
+            optimizer="sgd", lr=0.01, sgd_momentum=0.0, weight_decay=0.0, clip_grad=0.0
+        ),
+        [replay],
+    )
+    # Identical inputs on every rank make averaged FSDP gradients match eager gradients.
+    inputs = torch.randn(4, 2, config.hidden_size, device="cuda")
+
+    def train(model, optimizer):
+        outputs, input_gradients = [], []
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            hidden = inputs.detach().clone().requires_grad_(True)
+
+            def forward():
+                output = model(hidden_states=hidden, attention_mask=None)
+                outputs.append(output.detach())
+                return output.square().mean()
+
+            run_forward_backward_on_microbatches(model, forward)
+            input_gradients.append(hidden.grad.detach().clone())
+            optimizer.step()
+        return torch.stack(outputs), torch.stack(input_gradients)
+
+    expected_outputs, expected_gradients = train(reference, reference_optimizer)
+    outputs, gradients = train(replay, replay_optimizer)
+    torch.testing.assert_close(outputs, expected_outputs)
+    torch.testing.assert_close(gradients, expected_gradients)
 
 
 @pytest.mark.launch_on_gb200
@@ -92,7 +178,7 @@ def test_mxfp8_parameters(process_group_collection):
         module=block,
         pg_collection=process_group_collection,
     )
-    # FSDP installs DTensor shards; check the parameters used for compute.
+    # FSDP installs local shards; check the parameters used for compute.
     parameters = []
     for module in model.module.modules():
         if not isinstance(module, FsdpModule):
@@ -147,7 +233,7 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
     parameters = dict(wrapped.module.named_parameters())
     assert parameters
     for name, parameter in parameters.items():
-        local_parameter = parameter.to_local()
+        local_parameter = parameter
 
         # Some parameters use module-specific initializers, so only check those
         # initialized by the configured init method.
@@ -274,7 +360,7 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
     assert group.shard_layout is ShardLayout.UNPADDED
     # Weight and bias share one bf16 group and pack back to back without padding.
     assert group.main_weight.layout.size == sum(
-        parameter.sharded.numel() for parameter in group.fsdp_parameters
+        parameter.unsharded.numel() for parameter in group.fsdp_parameters
     )
 
     with pytest.raises(ValueError, match="incompatible with nccl_ub"):
@@ -704,8 +790,8 @@ def test_gradient_clipping_reaches_global_norm(
     parameters = [
         parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
     ]
-    assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
-    expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
+    assert all(not isinstance(parameter.grad, DTensor) for parameter in parameters)
+    expected_pre_clip_norm = global_norm([p.grad for p in parameters])
     assert (
         expected_pre_clip_norm > clip_grad
     ), "Test gradients must exceed the clipping threshold to exercise clipping."
@@ -715,7 +801,7 @@ def test_gradient_clipping_reaches_global_norm(
     assert success
     torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
     torch.testing.assert_close(
-        global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
+        global_norm([p.grad for p in parameters]), clip_grad, rtol=1e-3, atol=0
     )
 
 

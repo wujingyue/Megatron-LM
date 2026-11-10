@@ -1,4 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Uneven fan-in gradient split adapted from NVIDIA-NeMo/nv-mistralai-megatron,
+# revision 3ffc55243c888171e13022fc3b35c4ed9a342012, BSD-3-Clause (see LICENSE):
+# https://github.com/NVIDIA-NeMo/nv-mistralai-megatron/tree/3ffc55243c888171e13022fc3b35c4ed9a342012
 
 import logging
 from dataclasses import dataclass
@@ -389,7 +392,8 @@ class MultiModulePipelineCommunicator:
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     received_tensor = bridge_comm.recv_forward(
-                        recv_shape=self._next_bridge_recv_shapes.pop(bridge_comm, None)
+                        recv_shape=self._next_bridge_recv_shapes.pop(bridge_comm, None),
+                        expect_backward=not self._schedule_forward_only,
                     )
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:

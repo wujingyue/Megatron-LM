@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -105,6 +106,7 @@ def test_muon_matches_reference(
             ),
         )
     params = dict(model.named_parameters())
+    assert all(not isinstance(parameter, DTensor) for parameter in params.values())
     kwargs = dict(
         lr=0.05,
         momentum=0.9,
@@ -125,3 +127,8 @@ def test_muon_matches_reference(
     reference_losses = _train(reference, (reference_optimizer, reference_other), inputs)
     losses = _train(model, (optimizer, other_optimizer), inputs)
     torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
+    for parameter, state in optimizer.state.items():
+        momentum = state["momentum_buffer"]
+        assert not isinstance(momentum, DTensor)
+        assert momentum.shape == parameter.shape
+        assert momentum.dtype == parameter.dtype

@@ -1,0 +1,13 @@
+--- a/megatron/core/models/hybrid/hybrid_model.py
++++ b/megatron/core/models/hybrid/hybrid_model.py
+@@ -587,7 +587,9 @@
+         if in_inference_mode:
+             assert runtime_gather_output, "Inference must always gather TP logits"
+ 
+-        use_precomputed_mtp_embeddings = decoder_input is not None
++        # NT4 reproduction compatibility: historical MTP looked up token IDs.
++        # Main decoder_input keeps its composed multimodal embeddings.
++        use_precomputed_mtp_embeddings = False
+ 
+         # Decoder embedding.
+         if decoder_input is not None:

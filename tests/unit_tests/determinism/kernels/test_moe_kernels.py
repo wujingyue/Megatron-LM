@@ -35,7 +35,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe import batch_invariant, moe_utils
+from megatron.core.transformer.moe import batch_invariant, fused_a2a, moe_utils
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -72,7 +72,7 @@ HAVE_TE = moe_utils.HAVE_TE
 HAVE_TE_PERMUTE = HAVE_TE and moe_utils.fused_permute is not None
 HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
 HAVE_TE_DETERMINISTIC_AUX_LOSS = moe_utils.te_supports_deterministic_moe_aux_loss()
-from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
+from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2, HAVE_HYBRIDEP
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
 
@@ -1883,13 +1883,42 @@ class TestMoEModules:
                 id="flex-deepepv2-ep2",
                 marks=pytest.mark.skipif(not HAVE_DEEP_EP_V2, reason="DeepEP v2 not installed"),
             ),
+            pytest.param(
+                "flex",
+                2,
+                {"moe_flex_dispatcher_backend": "hybridep"},
+                id="flex-hybridep-ep2",
+                marks=pytest.mark.skipif(not HAVE_HYBRIDEP, reason="HybridEP not installed"),
+            ),
+            pytest.param(
+                "flex",
+                2,
+                {
+                    "moe_flex_dispatcher_backend": "hybridep",
+                    "moe_hybridep_max_num_tokens_per_rank": 8192,
+                },
+                id="flex-hybridep-ep2-reserved",
+                marks=pytest.mark.skipif(not HAVE_HYBRIDEP, reason="HybridEP not installed"),
+            ),
         ],
     )
-    def test_moe_layer_replays(self, dispatcher, ep, extra):
+    def test_moe_layer_replays(self, dispatcher, ep, extra, monkeypatch):
         if Utils.world_size % ep != 0 or (ep > 1 and Utils.world_size < ep):
             pytest.skip(f"needs a world size divisible by EP={ep}")
         self._init(ep=ep)
         seeded()
+        is_hybridep = extra.get("moe_flex_dispatcher_backend") == "hybridep"
+        initial_capacities = []
+        if is_hybridep:
+            torch.cuda.synchronize()
+            fused_a2a._hybrid_ep_buffer = None
+            original_initialize = fused_a2a.init_hybrid_ep_buffer
+
+            def initialize(*args, **kwargs):
+                initial_capacities.append(args[2])
+                return original_initialize(*args, **kwargs)
+
+            monkeypatch.setattr(fused_a2a, "init_hybrid_ep_buffer", initialize)
         config = _moe_config(
             moe_token_dispatcher_type=dispatcher, expert_model_parallel_size=ep, **extra
         )
@@ -1915,7 +1944,7 @@ class TestMoEModules:
         with deterministic_algorithms(True):
             prev_fill = torch.utils.deterministic.fill_uninitialized_memory
             try:
-                if extra.get("moe_flex_dispatcher_backend") in ("deepep", "deepepv2"):
+                if extra.get("moe_flex_dispatcher_backend") in ("deepep", "deepepv2", "hybridep"):
                     # PyTorch memory-fill kernels can race with DeepEP communication.
                     torch.utils.deterministic.fill_uninitialized_memory = False
                 assert_module_replays_bit_exact(
@@ -1927,6 +1956,12 @@ class TestMoEModules:
                 )
             finally:
                 torch.utils.deterministic.fill_uninitialized_memory = prev_fill
+                if is_hybridep:
+                    torch.cuda.synchronize()
+                    fused_a2a._hybrid_ep_buffer = None
+        if is_hybridep:
+            requested = extra.get("moe_hybridep_max_num_tokens_per_rank", 0)
+            assert initial_capacities == [max(4096, requested)]
 
     @pytest.mark.parametrize("recompute", [False, True], ids=["no_recompute", "moe_recompute"])
     def test_moe_layer_replay_topk_idx_replays(self, recompute):

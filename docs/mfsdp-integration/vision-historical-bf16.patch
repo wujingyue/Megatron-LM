@@ -1,0 +1,17 @@
+--- a/megatron/core/models/vision/vit_model.py
++++ b/megatron/core/models/vision/vit_model.py
+@@ -94,9 +94,11 @@
+         self.max_patches_per_side = max_patches_per_side
+ 
+         # freq_dim = head_dim // 4 (half for h, half for w in the head_dim//2 space).
+-        # Like LLM RoPE, keep frequencies outside module buffers so Float16Module
+-        # cannot cast them to BF16/FP16 before FP32 angle and sin/cos computation.
+-        self.freqs = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
++        # NT4 reproduction compatibility: match the historical BF16 frequencies.
++        # This experiment does not establish the correct pretrained precision.
++        self.freqs = (
++            1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
++        ).to(torch.bfloat16)
+ 
+     def forward(self, h_patches: int, w_patches: int, device: torch.device) -> torch.Tensor:
+         """

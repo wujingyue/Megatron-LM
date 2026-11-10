@@ -1148,6 +1148,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
+    moe_hybridep_max_num_tokens_per_rank: Optional[int] = None
+    """Minimum token capacity of the initial HybridEP buffer. Reserve the workload's
+    maximum input size to avoid later reallocations and kernel compilation. This changes
+    buffer allocation only; it does not drop tokens or set expert capacity.
+    """
+
     moe_hybridep_pad_uneven_dispatch_inputs: bool = False
     """Pad uneven HybridEP dispatch inputs to the group maximum before dispatch.
     Enable when local HybridEP input token counts can differ across ranks, for example
@@ -1487,6 +1493,11 @@ class TransformerConfig(ModelParallelConfig):
 
     ``None`` places all local layers in one block. This setting requires selective
     recomputation with ``"residual_stream"`` in ``recompute_modules``.
+
+    In HybridStack, ``1`` finalizes replay inside each execution layer's call so
+    its FSDP backward-pre hook can gather weights before replay. A Shortcut-MoE
+    pair stays in one region and must share an FSDP owner for replayed parameters.
+    Shorter regions retain more residual-stream boundary activations.
     """
 
     ####################

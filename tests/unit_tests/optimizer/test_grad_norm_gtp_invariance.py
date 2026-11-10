@@ -20,6 +20,8 @@ parameters tagged by hand. It does not verify that a real model tags its paramet
 correctly; that needs a check against the model's own parameter count at runtime.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -33,6 +35,58 @@ from tests.unit_tests.test_utilities import Utils
 ROWS_PER_WEIGHT = 8
 COLUMNS_PER_WEIGHT = 4
 GRADIENT_SEED = 20260904
+
+
+def test_mfsdp_local_parameter_norm_and_checkpoint_views_agree(monkeypatch):
+    """Local optimizer shards and checkpoint-only DTensors describe the same full weight."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+        FsdpContext,
+        Placements,
+        fully_shard,
+        fully_shard_context,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
+        named_checkpoint_parameters,
+    )
+    from megatron.training.utils import common_utils
+
+    torch.distributed._symmetric_memory.set_backend("NCCL")
+    Utils.initialize_distributed()
+    world_size = torch.distributed.get_world_size()
+    device = torch.device("cuda", torch.cuda.current_device())
+    mesh = init_device_mesh("cuda", (world_size,))
+    model = torch.nn.Linear(2, 2 * world_size, bias=False, device=device)
+    with torch.no_grad():
+        model.weight.fill_(1)
+    context = FsdpContext(device=device)
+    with fully_shard_context(context):
+        fully_shard(model, mesh, Placements([0], [Shard(0)], [Shard(0)], [Shard(0)]))
+    runtime_parameter = model.weight
+    assert not isinstance(runtime_parameter, DTensor)
+    assert runtime_parameter.numel() == 4
+    wrapper = SimpleNamespace(
+        named_parameters=model.named_parameters, stop_communication=context.finish_grad_sync
+    )
+    monkeypatch.setattr(common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=True))
+    monkeypatch.setattr(common_utils, "get_run_config", SimpleNamespace)
+
+    expected_squared_norm = float(4 * world_size)
+    assert common_utils.calc_params_l2_norm(wrapper) == expected_squared_norm**0.5
+    squared_norm = common_utils.calc_params_l2_norm(wrapper, return_squared_tensor=True)
+    assert squared_norm.item() == expected_squared_norm
+    checkpoint_parameters = [parameter for _, parameter in named_checkpoint_parameters(model)]
+    assert all(isinstance(parameter, DTensor) for parameter in checkpoint_parameters)
+    assert (
+        common_utils.calc_dtensor_params_l2_norm(
+            checkpoint_parameters, return_squared_tensor=True
+        ).item()
+        == expected_squared_norm
+    )
+    assert model.weight is runtime_parameter
+    assert not isinstance(model.weight, DTensor)
 
 
 class _ParametersOnlyOptimizer(MegatronOptimizer):

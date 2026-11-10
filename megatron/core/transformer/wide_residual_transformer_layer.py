@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -12,6 +13,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     load_residual_state,
+    map_residual_sharded_state,
 )
 
 
@@ -118,3 +120,11 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"hidden_size={self.config.hidden_size}, got "
                     f"{connection.branch_hidden_size}."
                 )
+
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """Preserve checkpoint names from before the residual read/write split."""
+        state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        map_residual_sharded_state(state_dict, prefix)
+        return state_dict

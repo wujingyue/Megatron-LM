@@ -415,7 +415,7 @@ class FsdpParameterGroup:
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
-                self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
+                self.main_weight.get_tensor_view(index), requires_grad=parameter.requires_grad
             )
             copy_parameter_attributes(parameter, sharded_parameter)
             if main_grad_dtype:
@@ -626,25 +626,27 @@ class FsdpParameterGroup:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
-        grads: list[torch.Tensor] = []
-        for fsdp_parameter in self.fsdp_parameters:
-            if fsdp_parameter.unsharded.grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
                 dtype=self.grad_comm_dtype,
-                device=grads[0].device,
+                device=self.main_grad.device,
             )
+
+    def copy_gradient_to_partial_buffer(self, index: int, partial_grad: DBuffer) -> None:
+        """Pack and release one complete parameter gradient on the caller's stream."""
+        parameter = self.fsdp_parameters[index]
+        if parameter.unsharded.grad is None:
+            raise RuntimeError(f"Missing gradient for FSDP parameter {parameter.fqns!r}.")
+        partial_grad.get_tensor_view(index).copy_(parameter.unsharded.grad)
+        parameter.unsharded.grad = None
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer."""
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
-            fsdp_parameter.unsharded.grad = None
+        for index in range(len(self.fsdp_parameters)):
+            self.copy_gradient_to_partial_buffer(index, partial_grad)
 
     def accumulate_local_gradients(self) -> None:
         """Accumulate on compute, retaining source gradients for caller cleanup.
@@ -670,7 +672,7 @@ class FsdpParameterGroup:
                 destination.copy_(grad)
                 if self.grad_scale != 1:
                     destination.mul_(self.grad_scale)
-        self._install_sharded_grads(self.main_grad)
+        self._install_sharded_grads(self.pre_optimizer_main_grad)
 
     def _has_sharded_grads(self) -> bool:
         """Whether installed .grad views select accumulation instead of overwrite.
@@ -739,7 +741,9 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        self._install_sharded_grads(self.main_grad)
+        # Local Parameters require optimizer-sized gradient views, including
+        # while accumulation still uses a larger DP-outer partial buffer.
+        self._install_sharded_grads(self.pre_optimizer_main_grad)
 
     def reduce_outer_gradients(self) -> None:
         """Finalize the deferred DP-outer reduction into the optimizer-layout view.
@@ -766,7 +770,7 @@ class FsdpParameterGroup:
     def _install_sharded_grads(self, grad_buffer: DBuffer) -> None:
         """Bind each sharded parameter's ``.grad`` to the given reduced gradient buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = grad_buffer.get_dtensor(index)
+            fsdp_parameter.sharded.grad = grad_buffer.get_tensor_view(index)
 
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> FsdpParameterGroup | None:

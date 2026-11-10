@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -377,6 +379,14 @@ _RESIDUAL_STATE_PREFIXES = tuple(
         ("write", "retention"),
     )
 )
+
+
+def map_residual_sharded_state(state_dict: ShardedStateDict, prefix: str) -> None:
+    """Preserve pre-split names on disk while retaining current model dictionary keys."""
+    apply_prefix_mapping(
+        state_dict,
+        {prefix + current: prefix + legacy for current, legacy in _RESIDUAL_STATE_PREFIXES},
+    )
 
 
 def load_residual_state(
