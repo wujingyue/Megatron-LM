@@ -86,17 +86,20 @@ class FsdpUnitCollector:
 
         # 3. Mark units whose owned parameters are replayed without their hooks.
         for unit in self._units:
+            owned_parameters = set()
+            for owned in self._owned_modules(unit):
+                owned_parameters.update(owned.parameters(recurse=False))
+
             for owned in self._owned_modules(unit):
                 if owned not in recomputed_modules:
                     continue
                 # An external checkpoint re-enters the whole unit's forward hooks.
                 if owned is unit and unit not in _rerun_submodules(unit):
                     continue
-                for submodule in self._owned_modules(owned):
-                    if next(submodule.parameters(recurse=False), None) is None:
-                        continue
-                    self._partially_recomputed_units.add(unit)
-                    break
+                if owned_parameters.isdisjoint(owned.parameters()):
+                    continue
+                self._partially_recomputed_units.add(unit)
+                break
         return self._units
 
     def is_partially_recomputed(self, unit: nn.Module) -> bool:
