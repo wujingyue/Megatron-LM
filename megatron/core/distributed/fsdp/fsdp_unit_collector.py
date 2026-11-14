@@ -92,10 +92,9 @@ class FsdpUnitCollector:
                 # An external checkpoint re-enters the whole unit's forward hooks.
                 if owned is unit and unit not in _rerun_submodules(unit):
                     continue
-                if any(
-                    next(submodule.parameters(recurse=False), None) is not None
-                    for submodule in self._owned_modules(owned)
-                ):
+                for submodule in self._owned_modules(owned):
+                    if next(submodule.parameters(recurse=False), None) is None:
+                        continue
                     self._partially_recomputed_units.add(unit)
                     break
         return self._units
