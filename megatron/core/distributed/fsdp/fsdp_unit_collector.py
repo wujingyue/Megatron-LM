@@ -86,8 +86,9 @@ class FsdpUnitCollector:
 
         # 3. Mark units whose owned parameters are replayed without their hooks.
         for unit in self._units:
-            owned = set(self._owned_modules(unit))
-            for rerun in owned.intersection(recomputed_modules):
+            for rerun in self._owned_modules(unit):
+                if rerun not in recomputed_modules:
+                    continue
                 # An external checkpoint re-enters the whole unit's forward hooks.
                 if rerun is unit and unit not in _rerun_submodules(unit):
                     continue
