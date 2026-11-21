@@ -280,6 +280,13 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
+        # No-grad evaluation has no backward events, so gather on demand without
+        # recording or advancing the training trace. Training-mode no-grad calls
+        # still participate: reentrant activation checkpointing uses those calls.
+        if not cast(nn.Module, self).training and not torch.is_grad_enabled():
+            self.unshard(Phase.FORWARD)
+            return
+
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
         if context.is_recording_execution_order and not is_recomputing:
